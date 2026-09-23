@@ -68,6 +68,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "识动 VisionFlow"
+APP_VERSION = "0.1.0-beta.1"
 SCRIPT_VERSION = 4
 APP_STYLESHEET = """
 QMainWindow, QDialog {
@@ -8955,6 +8956,7 @@ def enable_dark_title_bar(widget: QWidget) -> None:
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
     configure_ui_font(app)
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLESHEET)

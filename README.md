@@ -2,17 +2,17 @@
 
 识动 VisionFlow 是一个基于 PySide6 的可视化桌面自动化工具。用户可以通过流程图编排窗口任务，并执行鼠标、键盘、图片识别和 OCR 操作。界面采用深色工作台风格，项目内置 `assets\fonts\NotoSansSC-VF.ttf` 中文字体资源，启动时会优先注册，避免目标机器字体回退导致中文显示为方框。
 
-## 启动
+## 版本下载
 
-直接运行已打包的应用：
+[查看所有版本](https://github.com/zhanzongxiang/VisionFlow/releases)
 
-```powershell
-.\dist\AutomationTool-small.exe
-```
+| 版本 | 发布日期 | 下载 | 更新日志 |
+| --- | --- | --- | --- |
+| `v0.1.0-beta.1` | 2026-09-23 | [Windows x64](https://github.com/zhanzongxiang/VisionFlow/releases/download/v0.1.0-beta.1/VisionFlow-v0.1.0-beta.1-windows-x64.exe) · [SHA256](https://github.com/zhanzongxiang/VisionFlow/releases/download/v0.1.0-beta.1/SHA256SUMS.txt) · [源码 ZIP](https://github.com/zhanzongxiang/VisionFlow/archive/refs/tags/v0.1.0-beta.1.zip) | [查看更新内容](CHANGELOG.md) |
 
-发布目录必须包含由根目录权威配置 `AutomationTool-small.spec` 生成的 `AutomationTool-small.exe`。其他历史构建产物不作为正式发布入口。
+Windows 版为免安装程序，下载后可直接运行，无需安装 Python。当前版本尚未进行代码签名，Windows 可能显示来源提示；运行前可使用同一行提供的 SHA256 文件核对下载完整性。当前为公开测试版，窗口后台输入和最小化截图是否可用仍取决于目标程序的实现。
 
-从源码启动：
+## 从源码运行
 
 ```powershell
 python -m venv .venv
@@ -79,6 +79,17 @@ python app.py
 
 “模板库”页面会按任务素材目录和流程节点中的真实图片路径聚合素材。列表只显示缩略图和文件名；选中素材后，右侧会显示实际文件路径、引用次数以及具体任务/节点。双击引用或点击“定位到流程”可直接打开对应任务并选中节点。删除图片前会检查引用关系：未被引用的素材需要确认后才会删除，仍被节点使用的图片会被阻止删除，避免任务出现失效路径。相对路径解析与后台执行保持一致，优先使用任务同名目录，支持中文路径。
 
+## 更新日志
+
+### v0.1.0-beta.1
+
+- 上线沉浸式流程图编辑器，支持操作、判断、分支和循环。
+- 支持独立窗口任务、后台键鼠操作、宏录制、图片识别和 OCR。
+- 新增模板库、引用统计、流程节点定位和素材删除保护。
+- 改进中文路径、自动保存、轮次日志、停止任务和异常诊断。
+
+完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 打包
 
 项目使用 `AutomationTool-small.spec` 作为精简构建入口；该配置会通过 `collect_all('rapidocr_onnxruntime')` 收集 OCR 模型、二进制和隐藏导入，同时排除未使用的 Qt QML/Quick/PDF/SVG、视频编解码、OCR 工具模块和测试模块。它保留 Qt Widgets、OpenCV、完整 NumPy 运行时（包括 `numpy.linalg`）、ONNX Runtime、RapidOCR 和中文字体。
@@ -100,3 +111,7 @@ $env:AUTOMATION_BUILD_SMOKE = '0'
 ```
 
 自检入口不会进入正式程序。发布时可将精简版重命名为 `AutomationTool.exe`。如果目标机器已有中文字体，可以移除 spec 中的字体数据再减少约 17 MB，但不建议默认移除。
+
+## 第三方资源
+
+项目内置的 Noto Sans SC 字体来源于 [Google Fonts](https://fonts.google.com/noto/specimen/Noto+Sans+SC)，采用 [SIL Open Font License 1.1](assets/fonts/OFL.txt) 授权。

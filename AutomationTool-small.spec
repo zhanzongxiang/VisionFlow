@@ -32,6 +32,9 @@ for font_path in font_candidates:
     if font_path.is_file():
         datas.append((str(font_path), "fonts"))
         break
+font_license = spec_root / "assets/fonts/OFL.txt"
+if font_license.is_file():
+    datas.append((str(font_license), "fonts"))
 
 excludes = [
     # Optional PySide6 bindings not imported by the application.
