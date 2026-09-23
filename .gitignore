@@ -1,0 +1,37 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE and local agent state
+.idea/
+.vscode/
+.workbuddy/
+
+# PyInstaller and packaged releases
+build*/
+dist*/
+*.exe
+*.pkg
+*.zip
+*.rar
+*.7z
+*.spec
+!AutomationTool-small.spec
+
+# Local runtime data and diagnostics
+*.log
+*.reg
+/screenshots/
+/窗口任务 */
+/中文任务/
+
+# Generated UI review images in the project root
+/*.png
+
+# OS metadata
+.DS_Store
+Thumbs.db
