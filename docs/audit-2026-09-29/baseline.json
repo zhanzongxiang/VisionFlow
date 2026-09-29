@@ -1,0 +1,329 @@
+{
+  "generated_at": "2026-09-29T15:18:20.062387+08:00",
+  "scope": "Offline synthetic tests, no real capture/input/YOLO inference/GPU measurement",
+  "environment": {
+    "python": "3.11.15",
+    "os": "Windows-10-10.0.22631-SP0",
+    "logical_cpus": 20,
+    "opencv_threads": 20,
+    "packages": {
+      "PySide6": "6.11.2",
+      "opencv-python": "5.0.0.93",
+      "numpy": "2.4.6",
+      "onnxruntime": "1.30.0",
+      "rapidocr_onnxruntime": "1.4.4",
+      "pyinstaller": "6.22.2"
+    }
+  },
+  "sources": {
+    "app.py": {
+      "lines": 9311,
+      "bytes": 420108,
+      "sha256": "f31ab260af35058e968c3ae378d386160bfb0cab532cf232bf06b6cd25a7e02f",
+      "classes": {
+        "AutomationError": {
+          "start": 1270,
+          "end": 1271,
+          "methods": 0
+        },
+        "TemplateMatch": {
+          "start": 1362,
+          "end": 1366,
+          "methods": 0
+        },
+        "FlowNodeItem": {
+          "start": 1515,
+          "end": 1687,
+          "methods": 13
+        },
+        "FlowEdgeItem": {
+          "start": 1690,
+          "end": 1745,
+          "methods": 6
+        },
+        "FlowCanvas": {
+          "start": 1748,
+          "end": 2216,
+          "methods": 32
+        },
+        "ScreenSelectLabel": {
+          "start": 2219,
+          "end": 2274,
+          "methods": 6
+        },
+        "TemplateCaptureDialog": {
+          "start": 2277,
+          "end": 2426,
+          "methods": 8
+        },
+        "ScriptWorker": {
+          "start": 2429,
+          "end": 4852,
+          "methods": 65
+        },
+        "MainWindow": {
+          "start": 4898,
+          "end": 9257,
+          "methods": 140
+        }
+      }
+    },
+    "yolo_runtime.py": {
+      "lines": 143,
+      "bytes": 6545,
+      "sha256": "997e435c547b972ae7cc462ac9c54f9dee264914d0a64b7b2e0ff616786f8971",
+      "classes": {
+        "Detection": {
+          "start": 14,
+          "end": 23,
+          "methods": 1
+        },
+        "YoloDetector": {
+          "start": 26,
+          "end": 143,
+          "methods": 3
+        }
+      }
+    },
+    "game_daily.py": {
+      "lines": 280,
+      "bytes": 12030,
+      "sha256": "913f8f042c2efd6a0ca86ae44e1e7986783874a1d3ec890ec5e053a0b7cc4d04",
+      "classes": {
+        "ProfileError": {
+          "start": 13,
+          "end": 14,
+          "methods": 0
+        },
+        "CaptureInput": {
+          "start": 17,
+          "end": 20,
+          "methods": 2
+        },
+        "WindowBackend": {
+          "start": 120,
+          "end": 141,
+          "methods": 3
+        },
+        "VisualMatcher": {
+          "start": 144,
+          "end": 176,
+          "methods": 2
+        },
+        "DailyRunner": {
+          "start": 179,
+          "end": 259,
+          "methods": 5
+        }
+      }
+    }
+  },
+  "issue_probes": {
+    "F01_yolo_condition_rejected": {
+      "observed": true,
+      "errors": [
+        "判断节点“check”至少需要一张模板图片"
+      ]
+    },
+    "F03_model_path_not_synchronized": {
+      "observed": true,
+      "in_memory": "../external/game.onnx",
+      "exported": "script_assets/game.onnx"
+    },
+    "F04_missing_asset_negates_to_true": {
+      "observed": true
+    },
+    "F04_yolo_timeout_becomes_absence": {
+      "observed": true
+    },
+    "F05_objectness_output_misclassified": {
+      "observed": true,
+      "reported_scores": [
+        0.9900000095367432
+      ],
+      "expected_claim_score": 0.0099
+    },
+    "F06_daily_click_after_deadline": {
+      "observed": true,
+      "click_times_s": [
+        2.0
+      ],
+      "max_seconds": 1.0
+    },
+    "F06_optional_capture_exceeding_step_deadline_aborts": {
+      "observed": true,
+      "error": "截图完成时已超过任务时限",
+      "elapsed_s": 0.6
+    },
+    "F02_close_accepts_with_running_thread": {
+      "observed": true,
+      "scope": "close handler mock, no actual QThread destruction or crash attempted"
+    }
+  },
+  "vision_benchmarks": {
+    "template_1280x720_9_scales": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 348.036,
+      "p95_nearest_rank_ms": 365.671,
+      "min_ms": 340.197,
+      "max_ms": 365.671
+    },
+    "template_1280x720_1_scale_experiment": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 40.815,
+      "p95_nearest_rank_ms": 41.942,
+      "min_ms": 40.586,
+      "max_ms": 41.942
+    },
+    "template_1280x720_320x200_roi_9_scales_experiment": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 21.285,
+      "p95_nearest_rank_ms": 22.217,
+      "min_ms": 20.306,
+      "max_ms": 22.217
+    },
+    "template_1280x720_full_std": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 8.934,
+      "p95_nearest_rank_ms": 9.929,
+      "min_ms": 8.243,
+      "max_ms": 9.929
+    },
+    "template_1920x1080_9_scales": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 733.754,
+      "p95_nearest_rank_ms": 744.609,
+      "min_ms": 724.29,
+      "max_ms": 744.609
+    },
+    "template_1920x1080_1_scale_experiment": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 79.924,
+      "p95_nearest_rank_ms": 80.954,
+      "min_ms": 78.361,
+      "max_ms": 80.954
+    },
+    "template_1920x1080_320x200_roi_9_scales_experiment": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 22.534,
+      "p95_nearest_rank_ms": 26.755,
+      "min_ms": 21.299,
+      "max_ms": 26.755
+    },
+    "template_1920x1080_full_std": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 21.286,
+      "p95_nearest_rank_ms": 23.756,
+      "min_ms": 20.557,
+      "max_ms": 23.756
+    }
+  },
+  "gui_benchmarks": {
+    "library_refresh_20_png_hidden": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 40.369,
+      "p95_nearest_rank_ms": 42.264,
+      "min_ms": 39.675,
+      "max_ms": 42.264
+    },
+    "name_edit_20_png_hidden": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 38.688,
+      "p95_nearest_rank_ms": 42.798,
+      "min_ms": 38.111,
+      "max_ms": 42.798
+    },
+    "name_edit_20_image_decodes": 21,
+    "autosave_with_20_png_directory": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 3.629,
+      "p95_nearest_rank_ms": 4.248,
+      "min_ms": 3.459,
+      "max_ms": 4.248
+    },
+    "library_refresh_100_png_hidden": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 196.285,
+      "p95_nearest_rank_ms": 206.305,
+      "min_ms": 192.47,
+      "max_ms": 206.305
+    },
+    "name_edit_100_png_hidden": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 195.583,
+      "p95_nearest_rank_ms": 210.526,
+      "min_ms": 192.488,
+      "max_ms": 210.526
+    },
+    "name_edit_100_image_decodes": 101,
+    "autosave_with_100_png_directory": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 3.882,
+      "p95_nearest_rank_ms": 5.075,
+      "min_ms": 3.673,
+      "max_ms": 5.075
+    },
+    "flow_rebuild_100_actions": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 8.941,
+      "p95_nearest_rank_ms": 9.381,
+      "min_ms": 8.536,
+      "max_ms": 9.381
+    },
+    "flow_update_all_edges_100_actions": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 0.772,
+      "p95_nearest_rank_ms": 0.988,
+      "min_ms": 0.7,
+      "max_ms": 0.988
+    },
+    "validate_flow_100_actions": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 0.119,
+      "p95_nearest_rank_ms": 0.123,
+      "min_ms": 0.116,
+      "max_ms": 0.123
+    },
+    "flow_rebuild_500_actions": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 47.278,
+      "p95_nearest_rank_ms": 49.535,
+      "min_ms": 46.147,
+      "max_ms": 49.535
+    },
+    "flow_update_all_edges_500_actions": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 3.804,
+      "p95_nearest_rank_ms": 4.266,
+      "min_ms": 3.549,
+      "max_ms": 4.266
+    },
+    "validate_flow_500_actions": {
+      "samples": 7,
+      "warmups": 1,
+      "median_ms": 0.608,
+      "p95_nearest_rank_ms": 1.132,
+      "min_ms": 0.582,
+      "max_ms": 1.132
+    }
+  }
+}

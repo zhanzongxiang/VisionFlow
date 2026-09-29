@@ -1,0 +1,173 @@
+{
+  "generated_at": "2026-09-29T15:44:10.692802+08:00",
+  "scope": "Offline synthetic tests, no real capture/input/YOLO inference/GPU measurement",
+  "environment": {
+    "python": "3.11.15",
+    "os": "Windows-10-10.0.22631-SP0",
+    "logical_cpus": 20,
+    "opencv_threads": 20,
+    "packages": {
+      "PySide6": "6.11.2",
+      "opencv-python": "5.0.0.93",
+      "numpy": "2.4.6",
+      "onnxruntime": "1.30.0",
+      "rapidocr_onnxruntime": "1.4.4",
+      "pyinstaller": "6.22.2"
+    }
+  },
+  "sources": {
+    "app.py": {
+      "lines": 9311,
+      "bytes": 420108,
+      "sha256": "f31ab260af35058e968c3ae378d386160bfb0cab532cf232bf06b6cd25a7e02f",
+      "classes": {
+        "AutomationError": {
+          "start": 1270,
+          "end": 1271,
+          "methods": 0
+        },
+        "TemplateMatch": {
+          "start": 1362,
+          "end": 1366,
+          "methods": 0
+        },
+        "FlowNodeItem": {
+          "start": 1515,
+          "end": 1687,
+          "methods": 13
+        },
+        "FlowEdgeItem": {
+          "start": 1690,
+          "end": 1745,
+          "methods": 6
+        },
+        "FlowCanvas": {
+          "start": 1748,
+          "end": 2216,
+          "methods": 32
+        },
+        "ScreenSelectLabel": {
+          "start": 2219,
+          "end": 2274,
+          "methods": 6
+        },
+        "TemplateCaptureDialog": {
+          "start": 2277,
+          "end": 2426,
+          "methods": 8
+        },
+        "ScriptWorker": {
+          "start": 2429,
+          "end": 4852,
+          "methods": 65
+        },
+        "MainWindow": {
+          "start": 4898,
+          "end": 9257,
+          "methods": 140
+        }
+      }
+    },
+    "yolo_runtime.py": {
+      "lines": 143,
+      "bytes": 6545,
+      "sha256": "997e435c547b972ae7cc462ac9c54f9dee264914d0a64b7b2e0ff616786f8971",
+      "classes": {
+        "Detection": {
+          "start": 14,
+          "end": 23,
+          "methods": 1
+        },
+        "YoloDetector": {
+          "start": 26,
+          "end": 143,
+          "methods": 3
+        }
+      }
+    },
+    "game_daily.py": {
+      "lines": 280,
+      "bytes": 12030,
+      "sha256": "913f8f042c2efd6a0ca86ae44e1e7986783874a1d3ec890ec5e053a0b7cc4d04",
+      "classes": {
+        "ProfileError": {
+          "start": 13,
+          "end": 14,
+          "methods": 0
+        },
+        "CaptureInput": {
+          "start": 17,
+          "end": 20,
+          "methods": 2
+        },
+        "WindowBackend": {
+          "start": 120,
+          "end": 141,
+          "methods": 3
+        },
+        "VisualMatcher": {
+          "start": 144,
+          "end": 176,
+          "methods": 2
+        },
+        "DailyRunner": {
+          "start": 179,
+          "end": 259,
+          "methods": 5
+        }
+      }
+    }
+  },
+  "issue_probes": {
+    "F01_yolo_condition_rejected": {
+      "observed": true,
+      "errors": [
+        "判断节点“check”至少需要一张模板图片"
+      ]
+    },
+    "F03_model_path_not_synchronized": {
+      "observed": true,
+      "in_memory": "../external/game.onnx",
+      "exported": "script_assets/game.onnx"
+    },
+    "F04_missing_asset_negates_to_true": {
+      "observed": true
+    },
+    "F04_yolo_timeout_becomes_absence": {
+      "observed": true
+    },
+    "F05_objectness_output_misclassified": {
+      "observed": true,
+      "reported_scores": [
+        0.9900000095367432
+      ],
+      "expected_claim_score": 0.0099
+    },
+    "F06_daily_click_after_deadline": {
+      "observed": true,
+      "click_times_s": [
+        2.0
+      ],
+      "max_seconds": 1.0
+    },
+    "F06_optional_capture_exceeding_step_deadline_aborts": {
+      "observed": true,
+      "error": "截图完成时已超过任务时限",
+      "elapsed_s": 0.6
+    },
+    "F02_close_accepts_with_running_thread": {
+      "observed": true,
+      "scope": "close handler mock, no actual QThread destruction or crash attempted"
+    },
+    "F02_dispatch_after_inference_cancellation": {
+      "observed": true,
+      "scope": "mock dispatch only, no real input sent"
+    },
+    "F12_frozen_smoke_asserts_elided": {
+      "observed": true,
+      "smoke_source_assert_count": 6,
+      "build_setting": "AutomationTool-small.spec: Analysis optimize=1",
+      "scope": "source inspection and CPython optimized bytecode; frozen build not rerun"
+    }
+  }
+}

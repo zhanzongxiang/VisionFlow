@@ -4,13 +4,15 @@ import copy
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, QThread
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -36,6 +38,7 @@ class StorageRegressionTests(unittest.TestCase):
         self.window = app.MainWindow()
         self.addCleanup(self.window.deleteLater)
         self.addCleanup(self.window._autosave_timer.stop)
+        self.addCleanup(self.window._close_timer.stop)
 
     def _select_tasks(self, tasks: list[dict]) -> None:
         self.window.window_tasks = tasks
@@ -277,6 +280,146 @@ class StorageRegressionTests(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(shadow.read_bytes(), b"wrong")
         error.assert_called_once()
+
+    def test_model_export_syncs_actions_conditions_canvas_draft_and_second_export(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        model = self.root / "模型.onnx"
+        model.write_bytes(b"test model")
+        task = app.default_window_task(1)
+        step = app.default_step("window_click_yolo")
+        step.update(model="../模型.onnx", target_class="button")
+        task["steps"] = [step]
+        task["flow"] = app.flow_from_steps([step])
+        task["flow"]["nodes"].append({
+            "id": "check", "type": "condition", "x": 100, "y": 100,
+            "conditions": [{"type": "yolo_exists", "model": "../模型.onnx", "target_class": "button"}],
+        })
+        self.window.current_file = source / "original.json"
+        self._select_tasks([task])
+        action_id = self.window.flow_canvas.flow["nodes"][1]["id"]
+        self.window.flow_canvas.node_items[action_id].setSelected(True)
+        for folder in ("导出一", "导出二"):
+            destination = self.root / folder / "script.json"
+            with patch.object(app.QFileDialog, "getSaveFileName", return_value=(str(destination), "")):
+                self.assertTrue(self.window._export_json())
+            exported = json.loads(destination.read_text(encoding="utf-8"))["window_tasks"][0]
+            expected = exported["steps"][0]["model"]
+            self.assertTrue(expected.startswith("script_assets"))
+            worker = app.ScriptWorker([], destination.parent, output_dir=destination.parent / task["name"])
+            self.assertEqual(worker._resolve_input_path(expected).read_bytes(), b"test model")
+            draft = json.loads(str(self.window._draft_settings.value("draft")))
+            for current in (exported, self.window.window_tasks[0], draft["window_tasks"][0]):
+                self.assertEqual(current["steps"][0]["model"], expected)
+                self.assertEqual(current["flow"]["nodes"][1]["step"]["model"], expected)
+                self.assertEqual(current["flow"]["nodes"][-1]["conditions"][0]["model"], expected)
+            self.assertEqual(self.window.flow_canvas.flow["nodes"][1]["step"]["model"], expected)
+            self.assertEqual(self.window.yolo_model_edit.text(), expected)
+            restored = app.MainWindow()
+            self.addCleanup(restored.deleteLater)
+            self.addCleanup(restored._autosave_timer.stop)
+            self.assertEqual(restored.window_tasks[0]["steps"][0]["model"], expected)
+            self.assertEqual(restored.current_file, destination)
+
+    def test_pending_close_preserves_threads_and_discard_without_reprompting(self) -> None:
+        released = threading.Event()
+        entered = threading.Event()
+
+        class BlockedThread(QThread):
+            def run(self):
+                entered.set()
+                released.wait(5)
+
+        thread = BlockedThread(self.window)
+        worker = Mock()
+        key = id(self.window.window_tasks[0])
+        self.window.window_task_runs[key] = {"thread": thread, "worker": worker, "row": 0}
+        self.window.window_task_status[key] = "运行中"
+        baseline = str(self.window._draft_settings.value("draft"))
+        self.window.window_tasks[0]["name"] = "discard me"
+        self.window._set_dirty(True)
+        self.window._write_autosave()
+        thread.start()
+        self.assertTrue(entered.wait(2))
+        try:
+            with patch.object(app.QMessageBox, "question", return_value=QMessageBox.Discard) as prompt:
+                for _ in range(2):
+                    event = QCloseEvent()
+                    self.window.closeEvent(event)
+                    self.assertFalse(event.isAccepted())
+                self.assertTrue(thread.isRunning())
+                self.assertIn(key, self.window.window_task_runs)
+                self.assertTrue(self.window._close_timer.isActive())
+                worker.stop.assert_called_once()
+                with patch.object(app, "ScriptWorker") as constructor:
+                    self.window._start_window_task(0)
+                    constructor.assert_not_called()
+                released.set()
+                self.assertTrue(thread.wait(2000))
+                with patch.object(self.window, "close") as close:
+                    self.window._finish_pending_close()
+                    close.assert_called_once()
+                event = QCloseEvent()
+                self.window.closeEvent(event)
+                self.assertTrue(event.isAccepted())
+                prompt.assert_called_once()
+            self.assertEqual(self.window._draft_settings.value("draft"), baseline)
+            self.assertEqual(self.window.window_task_runs, {})
+        finally:
+            released.set()
+            thread.wait(2000)
+
+    def test_document_replacement_aborts_if_tasks_are_still_stopping(self) -> None:
+        original = self.window.window_tasks
+        source = self.root / "new.json"
+        source.write_text('{"window_tasks": []}', encoding="utf-8")
+        with (
+            patch.object(self.window, "_wait_for_window_tasks", return_value=False),
+            patch.object(app.QFileDialog, "getOpenFileName", return_value=(str(source), "")),
+        ):
+            self.window._new_script()
+            self.assertIs(self.window.window_tasks, original)
+            self.window._open_script()
+            self.assertIs(self.window.window_tasks, original)
+            self.assertIsNone(self.window.current_file)
+
+    def test_valid_yolo_condition_starts_task_thread(self) -> None:
+        self.window.current_file = self.root / "script.json"
+        task = app.default_window_task(1)
+        task["title_contains"] = "Synthetic target"
+        step = app.default_step("wait")
+        step["seconds"] = 0
+        task["flow"] = app.flow_from_steps([step])
+        action_id = task["flow"]["nodes"][1]["id"]
+        task["flow"]["nodes"].append({
+            "id": "check", "type": "condition", "x": 100, "y": 100, "operator": "and",
+            "conditions": [{"type": "yolo_exists", "model": "game.onnx", "target_class": "button"}],
+        })
+        task["flow"]["edges"] = [
+            {"from": "start", "to": "check", "port": "next"},
+            {"from": "check", "to": action_id, "port": "true"},
+            {"from": "check", "to": "end", "port": "false"},
+            {"from": action_id, "to": "end", "port": "next"},
+        ]
+        self._select_tasks([task])
+        with (
+            patch.object(app.ScriptWorker, "_find_window"),
+            patch.object(app.ScriptWorker, "_condition_yolo_exists", return_value=True) as detect,
+            patch.object(app.QMessageBox, "information") as warning,
+        ):
+            self.window._start_window_task(0)
+            try:
+                deadline = time.monotonic() + 3
+                while self.window.window_task_runs and time.monotonic() < deadline:
+                    self.qt_app.processEvents()
+                    time.sleep(.01)
+                self.assertFalse(self.window.window_task_runs)
+                warning.assert_not_called()
+                detect.assert_called_once()
+                self.assertEqual(self.window.window_task_status[id(task)], "已完成")
+            finally:
+                self.window._stop_all_window_tasks()
+                self.window._wait_for_window_tasks()
 
 
 if __name__ == "__main__":

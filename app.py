@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import copy
+import filecmp
 import importlib.util
 import math
 import re
@@ -17,6 +18,8 @@ import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from capture_collection import CollectionPage
 
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QBrush, QColor, QCloseEvent, QCursor, QFont, QFontDatabase, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QShortcut
@@ -68,7 +71,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "识动 VisionFlow"
-APP_VERSION = "0.1.0-beta.1"
+APP_VERSION = "0.1.0-beta.2"
 SCRIPT_VERSION = 4
 APP_STYLESHEET = """
 QMainWindow, QDialog {
@@ -1046,8 +1049,13 @@ QGraphicsView#flowCanvas {
 }
 QWidget#runHistoryPage,
 QWidget#templateLibraryPage,
+QWidget#collectionPage,
 QWidget#settingsPage {
     background: #0d1216;
+}
+QWidget#collectionSettings {
+    background: #131a1f;
+    border-right: 1px solid #2b3740;
 }
 QListWidget#runSessionList {
     background: #11181c;
@@ -1201,6 +1209,8 @@ STEP_TYPES = [
     ("click_image", "查找图片并点击"),
     ("window_wait_image", "窗口内等待图片"),
     ("window_click_image", "窗口内识别并点击"),
+    ("window_detect_yolo", "窗口内YOLO检测"),
+    ("window_click_yolo", "窗口内YOLO检测并点击"),
     ("ocr", "OCR文字识别"),
     ("window_ocr", "窗口内OCR文字识别"),
     ("find_window", "查找窗口"),
@@ -1225,6 +1235,11 @@ def default_step(step_type: str = "wait") -> dict[str, Any]:
         step["seconds"] = 1.0
     elif step_type in {"wait_image", "click_image", "window_wait_image", "window_click_image"}:
         step.update({"image": "", "confidence": 0.85, "timeout": 10.0, "offset_x": 0, "offset_y": 0})
+    elif step_type in {"window_detect_yolo", "window_click_yolo"}:
+        step.update({
+            "model": "", "target_class": "", "confidence": 0.5,
+            "timeout": 10.0, "offset_x": 0, "offset_y": 0,
+        })
     elif step_type in {"ocr", "window_ocr"}:
         step.update({"target_text": "", "confidence": 0.6, "timeout": 10.0})
     elif step_type == "find_window":
@@ -1460,12 +1475,27 @@ def validate_flow(flow: dict[str, Any]) -> list[str]:
             if operator not in {"and", "or", "not"}:
                 errors.append(f"判断节点“{node_id}”的匹配方式无效")
             conditions = node.get("conditions", [])
-            has_image = any(
-                isinstance(condition, dict) and str(condition.get("image", "")).strip()
-                for condition in conditions
-            ) if isinstance(conditions, list) else False
-            if not has_image:
-                errors.append(f"判断节点“{node_id}”至少需要一张模板图片")
+            if not isinstance(conditions, list) or not conditions:
+                errors.append(f"判断节点“{node_id}”至少需要一个判断条件")
+                conditions = []
+            for index, condition in enumerate(conditions, 1):
+                label = f"判断节点“{node_id}”的第 {index} 个条件"
+                if not isinstance(condition, dict):
+                    errors.append(f"{label}格式无效")
+                    continue
+                condition_type = condition.get("type", "image_exists")
+                if condition_type == "image_exists":
+                    if not isinstance(condition.get("image"), str) or not condition["image"].strip():
+                        errors.append(f"{label}需要模板图片")
+                elif condition_type == "yolo_exists":
+                    model = condition.get("model")
+                    if not isinstance(model, str) or not model.strip() or Path(model.strip()).suffix.lower() != ".onnx":
+                        errors.append(f"{label}需要 ONNX 模型")
+                    target = condition.get("target_class")
+                    if not isinstance(target, (str, int)) or isinstance(target, bool) or not str(target).strip():
+                        errors.append(f"{label}需要目标类别")
+                else:
+                    errors.append(f"{label}类型不受支持: {condition_type}")
         if node_type == "end":
             if choices:
                 errors.append("结束节点不能再连接后续节点")
@@ -2467,6 +2497,7 @@ class ScriptWorker(QObject):
         self._last_capture_backend = ""
         self._last_capture_detail = ""
         self._ocr_engine = None
+        self._yolo_models: dict[Path, Any] = {}
 
     @staticmethod
     def _step_label(step: dict[str, Any] | None) -> str:
@@ -2488,6 +2519,8 @@ class ScriptWorker(QObject):
             return f"{label} [{step.get('image', '') or '未设置图片'}]"
         if step_type in {"ocr", "window_ocr"}:
             return f"{label} [{step.get('target_text', '') or '任意文字'}]"
+        if step_type in {"window_detect_yolo", "window_click_yolo"}:
+            return f"{label} [{step.get('target_class', '') or '未设置类别'}]"
         if step_type == "find_window":
             criteria = step.get("title_contains") or step.get("process_name") or "未设置窗口条件"
             return f"{label} [{criteria}]"
@@ -2626,7 +2659,11 @@ class ScriptWorker(QObject):
         conditions = node.get("conditions", [])
         if not isinstance(conditions, list):
             conditions = []
-        results = [self._condition_image_exists(item) for item in conditions if isinstance(item, dict)]
+        results = [
+            self._condition_yolo_exists(item)
+            if item.get("type") == "yolo_exists" else self._condition_image_exists(item)
+            for item in conditions if isinstance(item, dict)
+        ]
         if not results:
             return False
         result = any(results) if operator == "or" else all(results)
@@ -2686,6 +2723,18 @@ class ScriptWorker(QObject):
         )
         return False
 
+    def _condition_yolo_exists(self, condition: dict[str, Any]) -> bool:
+        try:
+            self._wait_for_yolo(condition)
+            return True
+        except AutomationError as exc:
+            if self.stop_event.is_set() or self._permanent_capture_error(exc):
+                raise
+            if "超时" not in str(exc):
+                raise
+            self.log.emit(f"判断YOLO目标未出现 | {condition.get('target_class', '')} | {exc}")
+            return False
+
     def stop(self) -> None:
         self.stop_event.set()
 
@@ -2694,12 +2743,40 @@ class ScriptWorker(QObject):
             raise AutomationError("用户已停止脚本")
 
     def _sleep(self, seconds: float) -> None:
+        self._check_stopped()
         end = time.monotonic() + max(0.0, seconds)
         while time.monotonic() < end:
             self._check_stopped()
-            time.sleep(min(0.05, end - time.monotonic()))
+            self.stop_event.wait(max(0.0, min(0.05, end - time.monotonic())))
+        self._check_stopped()
+
+    def _run_cancellable_command(self, command: list[str], *, timeout: float):
+        """Cancel only this client process, never the shared ADB server."""
+        self._check_stopped()
+        deadline = time.monotonic() + timeout
+        with subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ) as process:
+            try:
+                while True:
+                    self._check_stopped()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        continue
+                    self._check_stopped()
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate()
 
     def execute_step(self, step: dict[str, Any]) -> None:
+        self._check_stopped()
         step_type = step.get("type")
         if step_type in {"click", "double_click", "move"}:
             self._mouse_action(step_type, int(step.get("x", 0)), int(step.get("y", 0)))
@@ -2721,6 +2798,7 @@ class ScriptWorker(QObject):
             self._sleep(float(step.get("seconds", 1)))
         elif step_type in {"wait_image", "click_image"}:
             point = self._wait_for_image(step)
+            self._check_stopped()
             if step_type == "click_image":
                 offset = (int(step.get("offset_x", 0)), int(step.get("offset_y", 0)))
                 click_point = (point[0] + offset[0], point[1] + offset[1])
@@ -2731,6 +2809,7 @@ class ScriptWorker(QObject):
                 self._mouse_action("click", click_point[0], click_point[1])
         elif step_type in {"window_wait_image", "window_click_image"}:
             point = self._wait_for_window_image(step)
+            self._check_stopped()
             if step_type == "window_click_image":
                 offset = (int(step.get("offset_x", 0)), int(step.get("offset_y", 0)))
                 click_point = (point[0] + offset[0], point[1] + offset[1])
@@ -2739,6 +2818,16 @@ class ScriptWorker(QObject):
                     f"偏移 ({offset[0]}, {offset[1]}) | 最终坐标 ({click_point[0]}, {click_point[1]})"
                 )
                 self._mouse_action("click", click_point[0], click_point[1])
+        elif step_type in {"window_detect_yolo", "window_click_yolo"}:
+            point = self._wait_for_yolo(step)
+            self._check_stopped()
+            if step_type == "window_click_yolo":
+                click_point = (
+                    point[0] + int(step.get("offset_x", 0)),
+                    point[1] + int(step.get("offset_y", 0)),
+                )
+                self.log.emit(f"YOLO点击坐标 | 识别 {point} | 最终 {click_point}")
+                self._mouse_action("click", *click_point)
         elif step_type == "ocr":
             self._wait_for_ocr(step, window=False)
         elif step_type == "window_ocr":
@@ -2751,8 +2840,17 @@ class ScriptWorker(QObject):
             raise AutomationError(f"不支持的步骤类型: {step_type}")
 
     def _mouse_action(self, action: str, x: int, y: int) -> None:
+        self._check_stopped()
         self.log.emit(f"执行鼠标动作 | {action} | 坐标 ({x}, {y})")
         if self.background_input and self.last_window is not None:
+            if self._emulator_capture_backend is not None:
+                if action == "move":
+                    raise AutomationError("ADB 不支持仅移动鼠标；请使用点击或拖拽")
+                for index in range(2 if action == "double_click" else 1):
+                    if index:
+                        self._sleep(0.08)
+                    self._adb_input(["tap", *map(str, self._adb_input_point(x, y))])
+                return
             self._post_background_mouse_action(action, x, y)
             return
         try:
@@ -2768,7 +2866,14 @@ class ScriptWorker(QObject):
             mouse.click(Button.left, 2)
 
     def _drag(self, start_x: int, start_y: int, end_x: int, end_y: int, duration: float) -> None:
+        self._check_stopped()
         if self.background_input and self.last_window is not None:
+            if self._emulator_capture_backend is not None:
+                start = self._adb_input_point(start_x, start_y)
+                end = self._adb_input_point(end_x, end_y)
+                duration_ms = max(50, min(600000, round(duration * 1000)))
+                self._adb_input(["swipe", *map(str, (*start, *end, duration_ms))], timeout=duration_ms / 1000 + 8)
+                return
             self._post_background_drag(start_x, start_y, end_x, end_y, duration)
             return
         try:
@@ -2778,7 +2883,9 @@ class ScriptWorker(QObject):
         mouse = Controller()
         duration = max(0.05, duration)
         samples = max(2, int(duration / 0.02))
+        self._check_stopped()
         mouse.position = (start_x, start_y)
+        self._check_stopped()
         mouse.press(Button.left)
         try:
             for index in range(1, samples + 1):
@@ -2793,6 +2900,8 @@ class ScriptWorker(QObject):
 
     def _run_macro(self, step: dict[str, Any]) -> None:
         if self.background_input and self.last_window is not None:
+            if self._emulator_capture_backend is not None:
+                self.log.emit("提示 | 宏动作仍通过 Win32 窗口消息执行；最小化模拟器可能不响应")
             self._run_macro_background(step)
             return
         try:
@@ -2877,7 +2986,19 @@ class ScriptWorker(QObject):
         return key
 
     def _press_key(self, key_name: str) -> None:
+        self._check_stopped()
         if self.background_input and self.last_window is not None:
+            if self._emulator_capture_backend is not None:
+                keys = {
+                    "ENTER": 66, "TAB": 61, "ESC": 4, "ESCAPE": 4, "BACK": 4,
+                    "HOME": 3, "SPACE": 62, "DELETE": 67, "BACKSPACE": 67,
+                    "UP": 19, "DOWN": 20, "LEFT": 21, "RIGHT": 22,
+                }
+                name = key_name.strip().upper()
+                if name not in keys:
+                    raise AutomationError(f"ADB 暂不支持按键 {key_name}，可使用基础导航键")
+                self._adb_input(["keyevent", str(keys[name])])
+                return
             self._post_background_key(key_name)
             return
         try:
@@ -2891,11 +3012,18 @@ class ScriptWorker(QObject):
             key = normalized
         if key is None:
             raise AutomationError(f"无法识别按键: {key_name}")
+        self._check_stopped()
         keyboard.press(key)
         keyboard.release(key)
 
     def _type_text(self, value: str) -> None:
+        self._check_stopped()
         if self.background_input and self.last_window is not None:
+            if self._emulator_capture_backend is not None:
+                if not value.isascii() or any(character in value for character in "\r\n\t"):
+                    raise AutomationError("ADB 文字输入首版仅支持单行 ASCII 文本")
+                self._adb_input(["text", value.replace("%", "%25").replace(" ", "%s")])
+                return
             self._post_background_text(value)
             return
         try:
@@ -3262,6 +3390,7 @@ class ScriptWorker(QObject):
         return button_id | mask, button_id
 
     def _post_background_mouse_action(self, action: str, x: int, y: int) -> None:
+        self._check_stopped()
         down_message, up_message, button_mask = self._background_mouse_messages("left")
         ctypes, user32, root = self._background_hwnd()
         targets = self._background_input_handles()
@@ -3282,6 +3411,7 @@ class ScriptWorker(QObject):
             held: list[tuple[int, int, int, int]] = []
             try:
                 for destination in targets:
+                    self._check_stopped()
                     self._send_background_message(down_message, button_mask, client_point, destination)
                     held.append((up_message, 0, client_point, destination))
                 self._sleep(0.04)
@@ -3299,6 +3429,7 @@ class ScriptWorker(QObject):
         end_y: int,
         duration: float,
     ) -> None:
+        self._check_stopped()
         down_message, up_message, button_mask = self._background_mouse_messages("left")
         ctypes, user32, root = self._background_hwnd()
         targets = self._background_input_handles()
@@ -3317,6 +3448,7 @@ class ScriptWorker(QObject):
         held: list[tuple[int, int, int, int]] = []
         try:
             for destination in targets:
+                self._check_stopped()
                 self._send_background_message(down_message, button_mask, start_point, destination)
                 held.append((up_message, 0, start_point, destination))
             for index in range(1, samples + 1):
@@ -3391,6 +3523,8 @@ class ScriptWorker(QObject):
         raise AutomationError(f"无法转换后台按键: {value}")
 
     def _post_background_key_event(self, value: Any, kind: str, pressed: bool, hwnd: int | None = None) -> None:
+        if pressed:
+            self._check_stopped()
         code = self._background_key_code(value, kind)
         self._post_background_message(
             0x0100 if pressed else 0x0101,
@@ -3400,6 +3534,7 @@ class ScriptWorker(QObject):
         )
 
     def _post_background_key(self, key_name: str) -> None:
+        self._check_stopped()
         key = key_name.strip()
         target = self._background_input_hwnd()
         code = self._background_key_code(key, "special")
@@ -3678,13 +3813,9 @@ class ScriptWorker(QObject):
                 root_pid = 0
         for manager in candidates:
             try:
-                result = subprocess.run(
+                result = self._run_cancellable_command(
                     [str(manager), "info", "--vmindex", "all"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
                     timeout=4,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    check=False,
                 )
             except (OSError, subprocess.SubprocessError):
                 continue
@@ -3762,16 +3893,10 @@ class ScriptWorker(QObject):
             raise AutomationError(f"图像依赖加载失败: {exc}") from exc
         adb = str(backend["adb"])
         serial = str(backend["serial"])
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
         def run_adb(arguments: list[str], timeout: float = 8):
-            return subprocess.run(
+            return self._run_cancellable_command(
                 [adb, *arguments],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
                 timeout=timeout,
-                creationflags=creationflags,
-                check=False,
             )
 
         def output_text(result) -> str:
@@ -3848,6 +3973,9 @@ class ScriptWorker(QObject):
         content = (0, 0, source_width, source_height)
         if width > 0 and height > 0 and (source_width != width or source_height != height):
             frame, content = fit_frame_to_size(cv2, frame, width, height)
+        if self.last_window is not None:
+            self.last_window["adb_source_size"] = (source_width, source_height)
+            self.last_window["adb_content_rect"] = content
         if not self._emulator_capture_logged:
             self._emulator_capture_logged = True
             left, top, content_width, content_height = content
@@ -3858,12 +3986,54 @@ class ScriptWorker(QObject):
             )
         return frame
 
+    def _adb_input_point(self, x: int, y: int) -> tuple[int, int]:
+        window = self.last_window or {}
+        if (
+            "adb_content_rect" not in window
+            or "adb_capture_origin" not in window
+            or self._last_capture_backend != "ADB"
+        ):
+            self._capture_window()
+        window = self.last_window or {}
+        if self._last_capture_backend != "ADB" or "adb_capture_origin" not in window:
+            raise AutomationError(f"ADB 输入需要有效的模拟器截图；{self._emulator_capture_error}")
+        origin_x, origin_y = window["adb_capture_origin"]
+        left, top, width, height = window["adb_content_rect"]
+        source_width, source_height = window["adb_source_size"]
+        local_x, local_y = int(x) - origin_x - left, int(y) - origin_y - top
+        if width <= 0 or height <= 0 or not (0 <= local_x < width and 0 <= local_y < height):
+            raise AutomationError(f"点击坐标 ({x}, {y}) 位于模拟器画面之外")
+        return (
+            min(source_width - 1, round(local_x * source_width / width)),
+            min(source_height - 1, round(local_y * source_height / height)),
+        )
+
+    def _adb_input(self, arguments: list[str], *, timeout: float = 8.0) -> None:
+        self._check_stopped()
+        backend = self._emulator_capture_backend
+        if backend is None:
+            raise AutomationError("未找到可用的模拟器 ADB 实例")
+        serial = str(backend["serial"])
+        try:
+            result = self._run_cancellable_command(
+                [str(backend["adb"]), "-s", serial, "shell", "input", *arguments],
+                timeout=timeout,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AutomationError(f"ADB 输入失败 | {serial} | {exc}") from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout or b"").decode("utf-8", errors="replace").strip()
+            raise AutomationError(f"ADB 输入失败 | {serial} | {detail or result.returncode}")
+        self._check_stopped()
+        self.log.emit(f"ADB 操作已发送 | {serial} | {' '.join(arguments)}")
+
     def _capture_window(self):
-        """Capture the target window client area through PrintWindow.
+        """Capture the target client area through ADB or PrintWindow.
 
         The returned origin is expressed in screen coordinates so existing
         background input and foreground mouse actions can consume it directly.
         """
+        self._check_stopped()
         if os.name != "nt":
             raise AutomationError("窗口内截图仅支持 Windows")
         try:
@@ -4029,74 +4199,72 @@ class ScriptWorker(QObject):
                 f"后台截图目标 | {capture_kind} HWND {capture_hwnd} | 尺寸 {width}x{height}"
             )
 
-        screen_dc = user32.GetDC(0)
-        if not screen_dc:
-            raise AutomationError("无法创建屏幕设备上下文")
-        memory_dc = None
-        bitmap = None
-        old_bitmap = None
-        try:
-            memory_dc = gdi32.CreateCompatibleDC(screen_dc)
-            bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
-            if not memory_dc or not bitmap:
-                raise AutomationError("无法创建窗口截图缓冲区")
-            old_bitmap = gdi32.SelectObject(memory_dc, bitmap)
-            if not old_bitmap:
-                raise AutomationError("无法初始化窗口截图缓冲区")
-            # PW_CLIENTONLY renders only the client area; flag 2 asks DWM to
-            # render the full content when the window is minimized.
-            captured = bool(user32.PrintWindow(hwnd, memory_dc, 0x00000003))
-            if not captured:
-                captured = bool(user32.PrintWindow(hwnd, memory_dc, 0x00000001))
-            if not captured and not bool(window.get("minimized", False)) and backend is None:
-                error = ctypes.get_last_error()
-                raise AutomationError(f"目标窗口不支持后台截图，错误码 {error}")
-            if captured:
-                info = BitmapInfo()
-                info.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
-                info.bmiHeader.biWidth = width
-                info.bmiHeader.biHeight = -height
-                info.bmiHeader.biPlanes = 1
-                info.bmiHeader.biBitCount = 32
-                info.bmiHeader.biCompression = 0  # BI_RGB
-                buffer = (ctypes.c_ubyte * (width * height * 4))()
-                copied = gdi32.GetDIBits(
-                    memory_dc,
-                    bitmap,
-                    0,
-                    height,
-                    ctypes.cast(buffer, handle_type),
-                    ctypes.byref(info),
-                    0,
-                )
-                if copied == height:
-                    frame = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))[:, :, :3].copy()
-                elif bool(window.get("minimized", False)) or backend is not None:
-                    frame = np.zeros((height, width, 3), dtype=np.uint8)
+        def capture_print_window():
+            self._check_stopped()
+            screen_dc = user32.GetDC(0)
+            if not screen_dc:
+                raise AutomationError("无法创建屏幕设备上下文")
+            memory_dc = bitmap = old_bitmap = None
+            try:
+                memory_dc = gdi32.CreateCompatibleDC(screen_dc)
+                bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+                if not memory_dc or not bitmap:
+                    raise AutomationError("无法创建窗口截图缓冲区")
+                old_bitmap = gdi32.SelectObject(memory_dc, bitmap)
+                if not old_bitmap:
+                    raise AutomationError("无法初始化窗口截图缓冲区")
+                # PrintWindow is synchronous; check cancellation between calls.
+                captured = bool(user32.PrintWindow(hwnd, memory_dc, 0x00000003))
+                self._check_stopped()
+                if not captured:
+                    captured = bool(user32.PrintWindow(hwnd, memory_dc, 0x00000001))
+                    self._check_stopped()
+                if not captured and not bool(window.get("minimized", False)):
+                    error = ctypes.get_last_error()
+                    raise AutomationError(f"目标窗口不支持后台截图，错误码 {error}")
+                if captured:
+                    info = BitmapInfo()
+                    info.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+                    info.bmiHeader.biWidth = width
+                    info.bmiHeader.biHeight = -height
+                    info.bmiHeader.biPlanes = 1
+                    info.bmiHeader.biBitCount = 32
+                    info.bmiHeader.biCompression = 0  # BI_RGB
+                    buffer = (ctypes.c_ubyte * (width * height * 4))()
+                    copied = gdi32.GetDIBits(
+                        memory_dc, bitmap, 0, height, ctypes.cast(buffer, handle_type),
+                        ctypes.byref(info), 0,
+                    )
+                    if copied == height:
+                        frame = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))[:, :, :3].copy()
+                    elif bool(window.get("minimized", False)):
+                        frame = np.zeros((height, width, 3), dtype=np.uint8)
+                    else:
+                        raise AutomationError("无法读取窗口截图像素")
                 else:
-                    raise AutomationError("无法读取窗口截图像素")
-            else:
-                # The framebuffer will be replaced by the emulator backend
-                # immediately after releasing the GDI resources.
-                frame = np.zeros((height, width, 3), dtype=np.uint8)
-        finally:
-            if old_bitmap and memory_dc:
-                gdi32.SelectObject(memory_dc, old_bitmap)
-            if bitmap:
-                gdi32.DeleteObject(bitmap)
-            if memory_dc:
-                gdi32.DeleteDC(memory_dc)
-            user32.ReleaseDC(0, screen_dc)
+                    frame = np.zeros((height, width, 3), dtype=np.uint8)
+                return frame
+            finally:
+                if old_bitmap and memory_dc:
+                    gdi32.SelectObject(memory_dc, old_bitmap)
+                if bitmap:
+                    gdi32.DeleteObject(bitmap)
+                if memory_dc:
+                    gdi32.DeleteDC(memory_dc)
+                user32.ReleaseDC(0, screen_dc)
 
         capture_backend = "PrintWindow"
-        # Prefer the emulator framebuffer whenever it is available. This keeps
-        # visible and minimized matching on one stable pixel source and avoids
-        # stale frames returned by hardware-accelerated renderer windows.
+        # ADB capture must not wait for a renderer's blocking PrintWindow call.
+        # Do not mix a failed ADB frame with stale Win32 input coordinates.
         if backend is not None:
-            emulator_frame = self._capture_emulator_frame(width, height)
-            if emulator_frame is not None:
-                frame = emulator_frame
-                capture_backend = "ADB"
+            frame = self._capture_emulator_frame(width, height)
+            self._check_stopped()
+            if frame is None:
+                raise AutomationError(f"ADB 截图暂不可用 | {self._emulator_capture_error}")
+            capture_backend = "ADB"
+        else:
+            frame = capture_print_window()
+        self._check_stopped()
         frame_std = float(frame.std())
         self._last_capture_backend = capture_backend
         self._last_capture_detail = f"{frame.shape[1]}x{frame.shape[0]} | 画面标准差 {frame_std:.1f}"
@@ -4145,6 +4313,8 @@ class ScriptWorker(QObject):
                     int(window.get("x", 0)) + client_offset_x,
                     int(window.get("y", 0)) + client_offset_y,
                 )
+        if capture_backend == "ADB":
+            window["adb_capture_origin"] = origin
         return cv2, frame, origin
 
     @staticmethod
@@ -4346,7 +4516,10 @@ class ScriptWorker(QObject):
                         else:
                             self.log.emit("后台输入使用顶层窗口，未发现可用渲染子窗口")
                     if self.background_input:
-                        self.log.emit("已启用后台窗口消息输入；将优先向渲染子窗口发送同步点击消息")
+                        if self._emulator_capture_backend is not None:
+                            self.log.emit("已识别 MuMu ADB 实例；点击、拖拽和基础按键将经 ADB 发送")
+                        else:
+                            self.log.emit("已启用后台窗口消息输入；将优先向渲染子窗口发送同步点击消息")
                     if window.get("minimized"):
                         geometry = (
                             f"还原=({window['normal_x']}, {window['normal_y']}, "
@@ -4504,6 +4677,84 @@ class ScriptWorker(QObject):
             f"超时 {timeout:.2f} 秒{capture_detail}{error_detail}{diagnostic_detail}"
         )
         raise AutomationError(f"窗口内图片超时: {image_path.name}")
+
+    def _wait_for_yolo(self, step: dict[str, Any]) -> tuple[int, int]:
+        model_path = self._resolve_input_path(str(step.get("model", "")))
+        if not model_path.is_file() or model_path.suffix.lower() != ".onnx":
+            raise AutomationError(f"请指定存在的 YOLO ONNX 模型: {model_path}")
+        target = str(step.get("target_class", "")).strip()
+        confidence = _safe_float(step.get("confidence", 0.5), 0.5, 0.1, 0.99)
+        timeout = _safe_float(step.get("timeout", 10.0), 10.0, 0.1)
+        detector = self._yolo_models.get(model_path)
+        if detector is None:
+            try:
+                from yolo_runtime import YoloDetector
+
+                detector = YoloDetector(model_path)
+                detector.class_id(target)
+            except Exception as exc:  # noqa: BLE001 - ONNX Runtime raises native model errors
+                raise AutomationError(f"YOLO 模型加载失败 | {model_path} | {exc}") from exc
+            self._yolo_models[model_path] = detector
+            self.log.emit(f"YOLO 模型已加载 | {model_path.name} | {len(detector.names)} 个类别")
+        try:
+            detector.class_id(target)
+        except ValueError as exc:
+            raise AutomationError(str(exc)) from exc
+        self.log.emit(
+            f"开始YOLO检测 | {model_path.name} | 类别 {target} | "
+            f"置信度 {confidence:.2f} | 超时 {timeout:.1f} 秒"
+        )
+        started = time.monotonic()
+        last_report = started
+        last_frame = None
+        capture_failures = 0
+        last_error = ""
+        while time.monotonic() - started < timeout:
+            self._check_stopped()
+            try:
+                _cv2, frame, origin = self._capture_window()
+                self._check_stopped()
+                last_frame = frame
+            except AutomationError as exc:
+                if self.stop_event.is_set() or self._permanent_capture_error(exc):
+                    raise
+                capture_failures += 1
+                last_error = str(exc)
+                if capture_failures == 1 or time.monotonic() - last_report >= 1:
+                    self.log.emit(f"YOLO 截图暂不可用 | 已重试 {capture_failures} 次 | {exc}")
+                    last_report = time.monotonic()
+                self._sleep(0.25)
+                continue
+            try:
+                detections = detector.detect(frame, target, confidence)
+            except Exception as exc:  # noqa: BLE001 - backend errors vary by ONNX Runtime version
+                raise AutomationError(f"YOLO 推理失败 | {model_path.name} | {exc}") from exc
+            self._check_stopped()
+            if detections:
+                match = max(detections, key=lambda item: item.score)
+                point = (origin[0] + match.center[0], origin[1] + match.center[1])
+                self.log.emit(
+                    f"YOLO 识别成功 | {match.name} | 置信度 {match.score:.3f} | "
+                    f"数量 {len(detections)} | 画面坐标 {match.center} | 操作坐标 {point} | "
+                    f"截图后端 {self._last_capture_backend}"
+                )
+                return point
+            if time.monotonic() - last_report >= 1:
+                self.log.emit(
+                    f"YOLO 检测中 | 未发现 {target} | 截图后端 {self._last_capture_backend} | "
+                    f"画面 {frame.shape[1]}x{frame.shape[0]}"
+                )
+                last_report = time.monotonic()
+            self._sleep(0.25)
+        diagnostic = self._save_recognition_failure_frame(
+            _cv2 if last_frame is not None else None, last_frame, model_path, "YOLO"
+        )
+        self.log.emit(
+            f"YOLO 未识别 | {model_path.name} | 类别 {target} | "
+            f"截图失败 {capture_failures} 次 | {last_error or '无截图错误'} | "
+            f"失败截图 {diagnostic or '无'}"
+        )
+        raise AutomationError(f"YOLO 检测超时: {target}")
 
     def _save_recognition_failure_frame(
         self, cv2_module, frame, image_path: Path, scope: str
@@ -4715,6 +4966,10 @@ class MainWindow(QMainWindow):
         self._draft_settings = QSettings("AutomationTool", "AutomationTool")
         self._last_accepted_draft: tuple[str, str] = ("", "")
         self._discarded_changes = False
+        self._close_requested = False
+        self._close_timer = QTimer(self)
+        self._close_timer.setInterval(100)
+        self._close_timer.timeout.connect(self._finish_pending_close)
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.setInterval(350)
@@ -5037,9 +5292,9 @@ class MainWindow(QMainWindow):
         self.window_background_check.hide()
         self.window_activate_check.hide()
         self.window_activate_check.setToolTip("命中目标后恢复最小化窗口并将其置前，前台模拟输入会发送到该窗口")
-        self.window_mode_label = QLabel("后台执行（固定）")
+        self.window_mode_label = QLabel("后台执行（MuMu 优先使用 ADB）")
         self.window_mode_label.setObjectName("fixedModeLabel")
-        self.window_mode_label.setToolTip("窗口任务始终使用后台消息输入，不会激活或抢占当前窗口")
+        self.window_mode_label.setToolTip("MuMu 经 ADB 截图和输入；其他窗口沿用后台消息，不会抢占鼠标")
         window_layout.addWidget(QLabel("已打开窗口"), 0, 0)
         window_layout.addWidget(self.window_choice_box, 0, 1, 1, 2)
         window_layout.addWidget(self.window_refresh_button, 0, 3)
@@ -5068,6 +5323,14 @@ class MainWindow(QMainWindow):
         self.condition_image_edit.setPlaceholderText("模板图片路径；多张图片用 ; 分隔")
         self.condition_image_edit.setToolTip("先选择与/或，再决定是否反向结果。多张图片用英文分号 ; 分隔")
         self.condition_image_button = QPushButton("选择")
+        self.condition_type_box = QComboBox()
+        self.condition_type_box.addItem("模板图片存在", "image_exists")
+        self.condition_type_box.addItem("YOLO目标存在", "yolo_exists")
+        self.condition_model_edit = QLineEdit()
+        self.condition_model_edit.setPlaceholderText("自训练模型 .onnx")
+        self.condition_model_button = QPushButton("选择")
+        self.condition_class_edit = QLineEdit()
+        self.condition_class_edit.setPlaceholderText("类别名或编号")
         self.condition_confidence_spin = QDoubleSpinBox()
         self.condition_confidence_spin.setRange(0.1, 0.99)
         self.condition_confidence_spin.setSingleStep(0.01)
@@ -5084,14 +5347,24 @@ class MainWindow(QMainWindow):
         condition_layout.addWidget(QLabel("匹配方式"), 0, 0)
         condition_layout.addWidget(self.condition_operator_box, 0, 1, 1, 3)
         condition_layout.addWidget(self.condition_negate_box, 1, 1, 1, 3)
-        condition_layout.addWidget(QLabel("模板图片"), 2, 0)
-        condition_layout.addWidget(self.condition_image_edit, 2, 1)
-        condition_layout.addWidget(self.condition_image_button, 2, 2)
-        condition_layout.addWidget(QLabel("置信度"), 3, 0)
-        condition_layout.addWidget(self.condition_confidence_spin, 3, 1)
-        condition_layout.addWidget(QLabel("检查超时"), 3, 2)
-        condition_layout.addWidget(self.condition_timeout_spin, 3, 3)
-        condition_layout.addWidget(self.condition_hint_label, 4, 0, 1, 4)
+        condition_layout.addWidget(QLabel("判断目标"), 2, 0)
+        condition_layout.addWidget(self.condition_type_box, 2, 1, 1, 3)
+        self.condition_image_label = QLabel("模板图片")
+        condition_layout.addWidget(self.condition_image_label, 3, 0)
+        condition_layout.addWidget(self.condition_image_edit, 3, 1, 1, 2)
+        condition_layout.addWidget(self.condition_image_button, 3, 3)
+        self.condition_model_label = QLabel("ONNX 模型")
+        condition_layout.addWidget(self.condition_model_label, 4, 0)
+        condition_layout.addWidget(self.condition_model_edit, 4, 1, 1, 2)
+        condition_layout.addWidget(self.condition_model_button, 4, 3)
+        self.condition_class_label = QLabel("目标类别")
+        condition_layout.addWidget(self.condition_class_label, 5, 0)
+        condition_layout.addWidget(self.condition_class_edit, 5, 1, 1, 3)
+        condition_layout.addWidget(QLabel("置信度"), 6, 0)
+        condition_layout.addWidget(self.condition_confidence_spin, 6, 1)
+        condition_layout.addWidget(QLabel("检查超时"), 6, 2)
+        condition_layout.addWidget(self.condition_timeout_spin, 6, 3)
+        condition_layout.addWidget(self.condition_hint_label, 7, 0, 1, 4)
         self.form.addRow("判断属性", self.condition_widget)
 
         self.key_edit = QLineEdit()
@@ -5153,6 +5426,19 @@ class MainWindow(QMainWindow):
         image_offset_layout.addWidget(QLabel("Y"), 0, 2)
         image_offset_layout.addWidget(self.image_offset_y_spin, 0, 3)
         self.form.addRow("点击偏移", self.image_offset_widget)
+        self.yolo_model_edit = QLineEdit()
+        self.yolo_model_edit.setPlaceholderText("选择自训练模型 .onnx")
+        self.yolo_model_button = QPushButton("选择")
+        self.yolo_model_row = QWidget()
+        yolo_model_layout = QHBoxLayout(self.yolo_model_row)
+        yolo_model_layout.setContentsMargins(0, 0, 0, 0)
+        yolo_model_layout.addWidget(self.yolo_model_edit)
+        yolo_model_layout.addWidget(self.yolo_model_button)
+        self.form.addRow("ONNX 模型", self.yolo_model_row)
+        self.yolo_class_edit = QLineEdit()
+        self.yolo_class_edit.setPlaceholderText("模型内的类别名或编号")
+        self.yolo_class_row = self._make_field_row(self.yolo_class_edit)
+        self.form.addRow("目标类别", self.yolo_class_row)
         self.path_edit = QLineEdit()
         self.path_row = self._make_field_row(self.path_edit)
         self.form.addRow("截图路径", self.path_row)
@@ -5180,8 +5466,12 @@ class MainWindow(QMainWindow):
             self.window_timeout_spin,
             self.window_probe_button,
             self.condition_operator_box,
+            self.condition_type_box,
             self.condition_image_edit,
             self.condition_image_button,
+            self.condition_model_edit,
+            self.condition_model_button,
+            self.condition_class_edit,
             self.condition_confidence_spin,
             self.condition_timeout_spin,
             self.key_edit,
@@ -5195,6 +5485,9 @@ class MainWindow(QMainWindow):
             self.timeout_spin,
             self.image_offset_x_spin,
             self.image_offset_y_spin,
+            self.yolo_model_edit,
+            self.yolo_model_button,
+            self.yolo_class_edit,
             self.path_edit,
         )
         for widget in inspector_inputs:
@@ -5209,6 +5502,8 @@ class MainWindow(QMainWindow):
             self.ocr_widget,
             self.image_row,
             self.image_offset_widget,
+            self.yolo_model_row,
+            self.yolo_class_row,
             self.path_row,
         ):
             row_widget.setMinimumWidth(0)
@@ -5266,6 +5561,7 @@ class MainWindow(QMainWindow):
         self.window_tasks_page.setObjectName("windowTasksPage")
         self.run_history_page = self._build_run_history_page()
         self.template_library_page = self._build_template_library_page()
+        self.collection_page = CollectionPage(ScriptWorker, self._draft_settings, self)
         self.settings_page = self._build_settings_page()
 
         self.main_tabs = QStackedWidget()
@@ -5275,6 +5571,7 @@ class MainWindow(QMainWindow):
             self.editor_page,
             self.run_history_page,
             self.template_library_page,
+            self.collection_page,
             self.settings_page,
         ):
             self.main_tabs.addWidget(page)
@@ -5305,12 +5602,14 @@ class MainWindow(QMainWindow):
         self.nav_flow_button = self._create_navigation_button("流程设计", QStyle.SP_FileDialogDetailedView)
         self.nav_logs_button = self._create_navigation_button("执行记录", QStyle.SP_MessageBoxInformation)
         self.nav_templates_button = self._create_navigation_button("模板库", QStyle.SP_FileIcon)
+        self.nav_collection_button = self._create_navigation_button("数据采集", QStyle.SP_DesktopIcon)
         self.nav_settings_button = self._create_navigation_button("设置", QStyle.SP_ComputerIcon)
         for button in (
             self.nav_tasks_button,
             self.nav_flow_button,
             self.nav_logs_button,
             self.nav_templates_button,
+            self.nav_collection_button,
         ):
             navigation_layout.addWidget(button, 0, Qt.AlignHCenter)
         navigation_layout.addStretch(1)
@@ -5338,6 +5637,7 @@ class MainWindow(QMainWindow):
         self.nav_flow_button.clicked.connect(lambda: self._show_workspace_page(self.editor_page))
         self.nav_logs_button.clicked.connect(lambda: self._show_workspace_page(self.run_history_page))
         self.nav_templates_button.clicked.connect(lambda: self._show_workspace_page(self.template_library_page))
+        self.nav_collection_button.clicked.connect(lambda: self._show_workspace_page(self.collection_page))
         self.nav_settings_button.clicked.connect(lambda: self._show_workspace_page(self.settings_page))
         self.inspector_close_button.clicked.connect(self._collapse_inspector)
         self.editor_task_box.currentIndexChanged.connect(self._editor_task_changed)
@@ -5388,13 +5688,20 @@ class MainWindow(QMainWindow):
         self.timeout_spin.valueChanged.connect(self._form_changed)
         self.image_offset_x_spin.valueChanged.connect(self._form_changed)
         self.image_offset_y_spin.valueChanged.connect(self._form_changed)
+        self.yolo_model_edit.textChanged.connect(self._form_changed)
+        self.yolo_class_edit.textChanged.connect(self._form_changed)
         self.path_edit.textChanged.connect(self._form_changed)
         self.condition_operator_box.currentIndexChanged.connect(self._condition_form_changed)
         self.condition_negate_box.stateChanged.connect(self._condition_form_changed)
         self.condition_image_edit.textChanged.connect(self._condition_form_changed)
+        self.condition_type_box.currentIndexChanged.connect(self._condition_form_changed)
+        self.condition_model_edit.textChanged.connect(self._condition_form_changed)
+        self.condition_class_edit.textChanged.connect(self._condition_form_changed)
         self.condition_confidence_spin.valueChanged.connect(self._condition_form_changed)
         self.condition_timeout_spin.valueChanged.connect(self._condition_form_changed)
         self.condition_image_button.clicked.connect(self._choose_condition_image)
+        self.condition_model_button.clicked.connect(lambda: self._choose_yolo_model(self.condition_model_edit))
+        self.yolo_model_button.clicked.connect(lambda: self._choose_yolo_model(self.yolo_model_edit))
         self.image_button.clicked.connect(self._choose_image)
         self.capture_button.clicked.connect(self._capture_template)
         self.capture_position_button.clicked.connect(self._capture_mouse_position)
@@ -5455,6 +5762,8 @@ class MainWindow(QMainWindow):
         elif page is self.template_library_page:
             count = self.template_list.count() if hasattr(self, "template_list") else 0
             context = f"模板库 · {count} 个素材"
+        elif page is self.collection_page:
+            context = "数据采集"
         else:
             context = "本地设置"
         self.workspace_context_label.setText(context)
@@ -5474,6 +5783,7 @@ class MainWindow(QMainWindow):
             self.editor_page: (self.nav_flow_button, "流程设计 · 更改自动保存"),
             self.run_history_page: (self.nav_logs_button, "执行记录 · 当前会话"),
             self.template_library_page: (self.nav_templates_button, "模板库 · 任务资源"),
+            self.collection_page: (self.nav_collection_button, "数据采集"),
             self.settings_page: (self.nav_settings_button, "本地设置"),
         }
         button, context = page_state.get(page, (None, APP_NAME))
@@ -5486,6 +5796,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.flow_canvas.fit_flow)
         elif page is self.template_library_page:
             self._refresh_template_library()
+        elif page is self.collection_page:
+            self.collection_page.refresh_windows()
 
     def _build_window_tasks_page(self) -> QWidget:
         page = QWidget()
@@ -6573,10 +6885,14 @@ class MainWindow(QMainWindow):
         return row
 
     def _new_script(self) -> None:
+        if self._close_requested:
+            return
         if not self._confirm_discard():
             return
         self._stop_all_window_tasks()
-        self._wait_for_window_tasks()
+        if not self._wait_for_window_tasks():
+            self.statusBar().showMessage("任务正在停止，请停止完成后再新建脚本", 5000)
+            return
         self._clear_autosave()
         self.current_file = None
         self.window_tasks = [default_window_task(1)]
@@ -6606,7 +6922,7 @@ class MainWindow(QMainWindow):
         }
 
     def _schedule_autosave(self) -> None:
-        if hasattr(self, "_autosave_timer"):
+        if hasattr(self, "_autosave_timer") and not self._close_requested:
             self._autosave_timer.start()
 
     def _write_autosave(self) -> None:
@@ -6781,7 +7097,8 @@ class MainWindow(QMainWindow):
             self.macro_repeat_spin, self.macro_interval_spin, self.window_widget,
             self.seconds_spin, self.ocr_target_edit, self.ocr_widget,
             self.image_edit, self.image_button, self.capture_button,
-            self.confidence_spin, self.timeout_spin, self.image_offset_widget, self.path_edit,
+            self.confidence_spin, self.timeout_spin, self.image_offset_widget,
+            self.yolo_model_row, self.yolo_class_row, self.path_edit,
         ):
             widget.setEnabled(False)
         self.node_name_edit.setEnabled(True)
@@ -6799,13 +7116,17 @@ class MainWindow(QMainWindow):
         self.condition_operator_box.setCurrentIndex(operator_index)
         self.condition_negate_box.setChecked(legacy_negate)
         conditions = node.get("conditions", [])
+        first = conditions[0] if isinstance(conditions, list) and conditions and isinstance(conditions[0], dict) else {}
+        condition_type = str(first.get("type", "image_exists"))
+        self.condition_type_box.setCurrentIndex(max(0, self.condition_type_box.findData(condition_type)))
         condition_images = [
             str(condition.get("image", ""))
             for condition in conditions
             if isinstance(condition, dict) and str(condition.get("image", "")).strip()
         ]
         self.condition_image_edit.setText("; ".join(condition_images))
-        first = conditions[0] if isinstance(conditions, list) and conditions and isinstance(conditions[0], dict) else {}
+        self.condition_model_edit.setText(str(first.get("model", "")))
+        self.condition_class_edit.setText(str(first.get("target_class", "")))
         try:
             confidence = min(0.99, max(0.1, float(first.get("confidence", 0.85))))
         except (TypeError, ValueError):
@@ -6817,13 +7138,15 @@ class MainWindow(QMainWindow):
         self.condition_confidence_spin.setValue(confidence)
         self.condition_timeout_spin.setValue(timeout)
         self._updating_form = False
+        self._update_condition_fields()
         self._set_form_row_visible(self.enabled_box, False)
         self._set_form_row_visible(self.type_box, False)
         self._set_form_row_visible(self.condition_widget, True)
         for field in (
             self.coordinate_widget, self.drag_widget, self.macro_widget, self.key_row,
             self.text_row, self.seconds_row, self.ocr_widget, self.image_row, self.confidence_row,
-            self.timeout_row, self.image_offset_widget, self.path_row, self.window_widget,
+            self.timeout_row, self.image_offset_widget, self.yolo_model_row,
+            self.yolo_class_row, self.path_row, self.window_widget,
         ):
             self._set_form_row_visible(field, False)
 
@@ -6858,9 +7181,35 @@ class MainWindow(QMainWindow):
                 self.condition_image_edit.setText(str(path))
             self._refresh_template_library_if_ready()
 
+    def _choose_yolo_model(self, target_edit: QLineEdit) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "选择 YOLO ONNX 模型", str(self._base_dir()), "ONNX 模型 (*.onnx)"
+        )
+        if filename:
+            path = Path(filename)
+            try:
+                target_edit.setText(str(path.relative_to(self._base_dir())))
+            except ValueError:
+                target_edit.setText(str(path))
+
+    def _update_condition_fields(self) -> None:
+        yolo = self.condition_type_box.currentData() == "yolo_exists"
+        for widget in (self.condition_image_label, self.condition_image_edit, self.condition_image_button):
+            widget.setVisible(not yolo)
+        for widget in (
+            self.condition_model_label, self.condition_model_edit, self.condition_model_button,
+            self.condition_class_label, self.condition_class_edit,
+        ):
+            widget.setVisible(yolo)
+        self.condition_hint_label.setText(
+            "根据检测到的目标选择“是/否”出口；可用非反转结果"
+            if yolo else "与：全部图片存在；或：任意图片存在；非：反转最终结果"
+        )
+
     def _condition_form_changed(self, *_args) -> None:
         if self._updating_form:
             return
+        self._update_condition_fields()
         node = self._selected_flow_node()
         if node is None or node.get("type") != "condition":
             return
@@ -6871,20 +7220,29 @@ class MainWindow(QMainWindow):
             item.strip() for item in re.split(r"[;；]", self.condition_image_edit.text())
             if item.strip()
         ]
-        node["conditions"] = [
-            {
-                "type": "image_exists",
-                "image": image,
+        if self.condition_type_box.currentData() == "yolo_exists":
+            node["conditions"] = [{
+                "type": "yolo_exists",
+                "model": self.condition_model_edit.text().strip(),
+                "target_class": self.condition_class_edit.text().strip(),
                 "confidence": self.condition_confidence_spin.value(),
                 "timeout": self.condition_timeout_spin.value(),
-            }
-            for image in images
-        ] or [{
-            "type": "image_exists",
-            "image": "",
-            "confidence": self.condition_confidence_spin.value(),
-            "timeout": self.condition_timeout_spin.value(),
-        }]
+            }]
+        else:
+            node["conditions"] = [
+                {
+                    "type": "image_exists",
+                    "image": image,
+                    "confidence": self.condition_confidence_spin.value(),
+                    "timeout": self.condition_timeout_spin.value(),
+                }
+                for image in images
+            ] or [{
+                "type": "image_exists",
+                "image": "",
+                "confidence": self.condition_confidence_spin.value(),
+                "timeout": self.condition_timeout_spin.value(),
+            }]
         self.flow_canvas.scene.update()
         self._flow_changed()
 
@@ -7351,6 +7709,8 @@ class MainWindow(QMainWindow):
             self._start_window_task(row, clear_log=False)
 
     def _start_window_task(self, row: int, *, clear_log: bool = True) -> None:
+        if self._close_requested:
+            return
         if row < 0 or row >= len(self.window_tasks):
             return
         task = self.window_tasks[row]
@@ -7404,15 +7764,23 @@ class MainWindow(QMainWindow):
             interval=float(task.get("interval", 0.5)),
         )
         worker.moveToThread(thread)
-        self.window_task_runs[task_key] = {
+        run_state = {
             "thread": thread,
             "worker": worker,
             "row": row,
             "stop_requested": False,
         }
+        self.window_task_runs[task_key] = run_state
+
+        def record_completion(success: bool, message: str) -> None:
+            # Only cache data here; this direct slot runs on the worker thread.
+            # The GUI consumes it if queued signals outlive their QObject sender.
+            run_state["result"] = (success, message)
+
         self.window_task_status[task_key] = "运行中"
         self._window_worker_meta[id(worker)] = (task_key, task_name)
         worker.log.connect(self._on_window_worker_log, Qt.QueuedConnection)
+        worker.completed.connect(record_completion, Qt.DirectConnection)
         worker.completed.connect(self._on_window_worker_completed, Qt.QueuedConnection)
         # QThread.quit is thread-safe. A direct connection lets the worker
         # stop its own event loop immediately instead of waiting for the GUI
@@ -7481,6 +7849,11 @@ class MainWindow(QMainWindow):
     def _window_task_finished(self, task_key: int, task_name: str, success: bool, message: str) -> None:
         if not any(id(task) == task_key for task in self.window_tasks):
             return
+        run = self.window_task_runs.get(task_key)
+        if run is not None:
+            if run.get("completion_reported"):
+                return
+            run["completion_reported"] = True
         selected = self.task_list.currentRow()
         stopped = "停止" in str(message) and not success
         self.window_task_status[task_key] = "已停止" if stopped else ("已完成" if success else f"失败: {message}")
@@ -7489,7 +7862,11 @@ class MainWindow(QMainWindow):
         self._refresh_window_task_list(selected)
 
     def _window_task_thread_finished(self, task_key: int) -> None:
-        run = self.window_task_runs.pop(task_key, None)
+        run = self.window_task_runs.get(task_key)
+        if run and "result" in run and not run.get("completion_reported"):
+            _key, task_name = self._window_worker_meta.get(id(run.get("worker")), (task_key, "窗口任务"))
+            self._window_task_finished(task_key, task_name, *run["result"])
+        self.window_task_runs.pop(task_key, None)
         selected = self.task_list.currentRow()
         # A queued completed signal can be overtaken by QThread.finished when
         # the worker exits during shutdown. Never leave the UI in the transient
@@ -7528,11 +7905,11 @@ class MainWindow(QMainWindow):
             self._update_window_task_status_label()
             self._refresh_window_task_list(self.task_list.currentRow())
 
-    def _wait_for_window_tasks(self, timeout_ms: int = 1500) -> None:
+    def _wait_for_window_tasks(self, timeout_ms: int = 1500) -> bool:
         """Request task threads to exit and wait briefly during document/window shutdown."""
         runs = list(self.window_task_runs.items())
         if not runs:
-            return
+            return True
         for _task_key, run in runs:
             run["thread"].quit()
         deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
@@ -7543,7 +7920,8 @@ class MainWindow(QMainWindow):
             run["thread"].wait(remaining)
         for task_key, run in runs:
             if not run["thread"].isRunning():
-                self.window_task_runs.pop(task_key, None)
+                self._window_task_thread_finished(task_key)
+        return not self.window_task_runs
 
     def _clear_form(self) -> None:
         self._cancel_mouse_capture()
@@ -7567,7 +7945,8 @@ class MainWindow(QMainWindow):
                        self.window_widget,
                        self.seconds_spin, self.ocr_target_edit, self.ocr_widget,
                        self.image_edit, self.image_button, self.capture_button,
-                       self.confidence_spin, self.timeout_spin, self.image_offset_widget, self.path_edit, self.condition_widget):
+                       self.confidence_spin, self.timeout_spin, self.image_offset_widget,
+                       self.yolo_model_row, self.yolo_class_row, self.path_edit, self.condition_widget):
             widget.setEnabled(False)
         self.macro_event_table.clearContents()
         self.macro_event_table.setRowCount(0)
@@ -7593,7 +7972,8 @@ class MainWindow(QMainWindow):
                        self.window_widget,
                        self.seconds_spin, self.ocr_target_edit, self.ocr_widget,
                        self.image_edit, self.image_button, self.capture_button,
-                       self.confidence_spin, self.timeout_spin, self.image_offset_widget, self.path_edit, self.condition_widget):
+                       self.confidence_spin, self.timeout_spin, self.image_offset_widget,
+                       self.yolo_model_row, self.yolo_class_row, self.path_edit, self.condition_widget):
             widget.setEnabled(True)
         step = self.steps[row]
         self.node_name_edit.setText(str(step.get("label", "")))
@@ -7627,6 +8007,8 @@ class MainWindow(QMainWindow):
         self.seconds_spin.setValue(float(step.get("seconds", 1)))
         self.ocr_target_edit.setText(str(step.get("target_text", "")))
         self.image_edit.setText(str(step.get("image", "")))
+        self.yolo_model_edit.setText(str(step.get("model", "")))
+        self.yolo_class_edit.setText(str(step.get("target_class", "")))
         self.confidence_spin.setValue(float(step.get("confidence", 0.85)))
         self.timeout_spin.setValue(float(step.get("timeout", 10)))
         self.image_offset_x_spin.setValue(int(step.get("offset_x", 0)))
@@ -7739,12 +8121,15 @@ class MainWindow(QMainWindow):
             "window_click_image",
         }
         self._set_form_row_visible(self.image_row, image_visible)
-        recognition_visible = image_visible or ocr_visible
+        yolo_visible = step_type in {"window_detect_yolo", "window_click_yolo"}
+        self._set_form_row_visible(self.yolo_model_row, yolo_visible)
+        self._set_form_row_visible(self.yolo_class_row, yolo_visible)
+        recognition_visible = image_visible or ocr_visible or yolo_visible
         self._set_form_row_visible(self.confidence_row, recognition_visible)
         self._set_form_row_visible(self.timeout_row, recognition_visible)
         self._set_form_row_visible(
             self.image_offset_widget,
-            step_type in {"click_image", "window_click_image"},
+            step_type in {"click_image", "window_click_image", "window_click_yolo"},
         )
         self._set_form_row_visible(self.path_row, step_type == "screenshot")
         self._set_form_row_visible(self.window_widget, step_type == "find_window")
@@ -7841,6 +8226,15 @@ class MainWindow(QMainWindow):
         elif new_type in {"wait_image", "click_image", "window_wait_image", "window_click_image"}:
             step.update({
                 "image": self.image_edit.text(),
+                "confidence": self.confidence_spin.value(),
+                "timeout": self.timeout_spin.value(),
+                "offset_x": self.image_offset_x_spin.value(),
+                "offset_y": self.image_offset_y_spin.value(),
+            })
+        elif new_type in {"window_detect_yolo", "window_click_yolo"}:
+            step.update({
+                "model": self.yolo_model_edit.text().strip(),
+                "target_class": self.yolo_class_edit.text().strip(),
                 "confidence": self.confidence_spin.value(),
                 "timeout": self.timeout_spin.value(),
                 "offset_x": self.image_offset_x_spin.value(),
@@ -8391,6 +8785,8 @@ class MainWindow(QMainWindow):
         return destination
 
     def _open_script(self) -> None:
+        if self._close_requested:
+            return
         filename, _ = QFileDialog.getOpenFileName(self, "打开脚本", str(self._base_dir()), "自动化脚本 (*.json)")
         if not filename:
             return
@@ -8434,7 +8830,10 @@ class MainWindow(QMainWindow):
                 normalized_tasks = [default_window_task(1)]
             self._autosave_timer.stop()
             self._stop_all_window_tasks()
-            self._wait_for_window_tasks()
+            if not self._wait_for_window_tasks():
+                self.statusBar().showMessage("任务正在停止，请停止完成后再打开脚本", 5000)
+                self._schedule_autosave()
+                return
             self.window_task_status.clear()
             self.window_tasks = normalized_tasks
             self.current_file = self._resolve_script_file(filename)
@@ -8469,6 +8868,8 @@ class MainWindow(QMainWindow):
             "click_image": ("image", "confidence", "timeout", "offset_x", "offset_y"),
             "window_wait_image": ("image", "confidence", "timeout"),
             "window_click_image": ("image", "confidence", "timeout", "offset_x", "offset_y"),
+            "window_detect_yolo": ("model", "target_class", "confidence", "timeout"),
+            "window_click_yolo": ("model", "target_class", "confidence", "timeout", "offset_x", "offset_y"),
             "ocr": ("target_text", "confidence", "timeout"),
             "window_ocr": ("target_text", "confidence", "timeout"),
             "find_window": (
@@ -8499,6 +8900,14 @@ class MainWindow(QMainWindow):
             step["confidence"] = _safe_float(step.get("confidence", 0.85), 0.85, 0.1, 0.99)
             step["timeout"] = _safe_float(step.get("timeout", 10.0), 10.0, 0.1)
             if step_type in {"click_image", "window_click_image"}:
+                step["offset_x"] = _safe_int(step.get("offset_x", 0), 0)
+                step["offset_y"] = _safe_int(step.get("offset_y", 0), 0)
+        elif step_type in {"window_detect_yolo", "window_click_yolo"}:
+            step["model"] = str(step.get("model", "") or "")
+            step["target_class"] = str(step.get("target_class", "") or "")
+            step["confidence"] = _safe_float(step.get("confidence", 0.5), 0.5, 0.1, 0.99)
+            step["timeout"] = _safe_float(step.get("timeout", 10.0), 10.0, 0.1)
+            if step_type == "window_click_yolo":
                 step["offset_x"] = _safe_int(step.get("offset_x", 0), 0)
                 step["offset_y"] = _safe_int(step.get("offset_y", 0), 0)
         if step_type == "find_window":
@@ -8575,16 +8984,29 @@ class MainWindow(QMainWindow):
                     else:
                         node["operator"] = operator if operator in {"and", "or"} else "and"
                         node["negate"] = bool(raw_node.get("negate", False))
-                    node["conditions"] = [
-                        {
-                            "type": "image_exists",
-                            "image": str(condition.get("image", "")),
-                            "confidence": _safe_float(condition.get("confidence", 0.85), 0.85, 0.1, 0.99),
-                            "timeout": _safe_float(condition.get("timeout", 1.0), 1.0, 0.1),
-                        }
-                        for condition in raw_node.get("conditions", [])
-                        if isinstance(condition, dict)
-                    ] or [{"type": "image_exists", "image": "", "confidence": 0.85, "timeout": 1.0}]
+                    node["conditions"] = []
+                    for condition in raw_node.get("conditions", []):
+                        if not isinstance(condition, dict):
+                            continue
+                        if condition.get("type") == "yolo_exists":
+                            node["conditions"].append({
+                                "type": "yolo_exists",
+                                "model": str(condition.get("model", "")),
+                                "target_class": str(condition.get("target_class", "")),
+                                "confidence": _safe_float(condition.get("confidence", 0.5), 0.5, 0.1, 0.99),
+                                "timeout": _safe_float(condition.get("timeout", 1.0), 1.0, 0.1),
+                            })
+                        else:
+                            node["conditions"].append({
+                                "type": "image_exists",
+                                "image": str(condition.get("image", "")),
+                                "confidence": _safe_float(condition.get("confidence", 0.85), 0.85, 0.1, 0.99),
+                                "timeout": _safe_float(condition.get("timeout", 1.0), 1.0, 0.1),
+                            })
+                    if not node["conditions"]:
+                        node["conditions"] = [{
+                            "type": "image_exists", "image": "", "confidence": 0.85, "timeout": 1.0
+                        }]
                 normalized_nodes.append(node)
             node_ids = {node["id"] for node in normalized_nodes}
             normalized_edges = [
@@ -8640,45 +9062,47 @@ class MainWindow(QMainWindow):
                     references.extend(node.get("conditions", []))
             seen_references: set[int] = set()
             for item in references:
-                if not isinstance(item, dict) or "image" not in item:
+                if not isinstance(item, dict):
                     continue
                 if id(item) in seen_references:
                     continue
                 seen_references.add(id(item))
-                if item.get("type") not in {
+                yolo = item.get("type") in {"window_detect_yolo", "window_click_yolo", "yolo_exists"}
+                if not yolo and item.get("type") not in {
                     "wait_image", "click_image", "window_wait_image", "window_click_image", "image_exists",
                 }:
                     continue
-                image = str(item.get("image", "")).strip()
-                if not image:
+                field = "model" if yolo else "image"
+                asset = str(item.get(field, "")).strip()
+                if not asset:
                     continue
-                relative = Path(image)
+                relative = Path(asset)
                 if relative.is_absolute():
                     continue
-                task_image = task_source / relative
-                from_task = task_image.is_file()
-                source = (task_image if from_task else source_root / relative).resolve()
+                task_asset = task_source / relative
+                from_task = task_asset.is_file()
+                source = (task_asset if from_task else source_root / relative).resolve()
                 if not source.is_file():
-                    raise FileNotFoundError(f"模板图片不存在，无法导出可用脚本: {source}")
+                    raise FileNotFoundError(f"素材不存在，无法导出可用脚本: {source}")
                 target = ((task_target if from_task else target_root) / relative).resolve()
                 if not target.is_relative_to(target_root):
                     # An external ../ path cannot be reproduced inside the export folder.
                     name = f"{uuid.uuid5(uuid.NAMESPACE_URL, str(source)).hex[:12]}_{source.name}"
-                    item["image"] = str(Path("script_assets") / name)
+                    item[field] = str(Path("script_assets") / name)
                     target = target_root / "script_assets" / name
-                task_resolution = (task_target / Path(str(item["image"]))).resolve()
-                if task_resolution != target and task_resolution.is_file() and task_resolution.read_bytes() != source.read_bytes():
-                    raise FileExistsError(f"任务目录中的同名图片会覆盖导出后的模板: {task_resolution}")
+                task_resolution = (task_target / Path(str(item[field]))).resolve()
+                if task_resolution != target and task_resolution.is_file() and not filecmp.cmp(task_resolution, source, shallow=False):
+                    raise FileExistsError(f"任务目录中的同名素材会覆盖导出的文件: {task_resolution}")
                 if target == destination.resolve():
-                    raise FileExistsError(f"模板图片与导出脚本路径冲突: {target}")
+                    raise FileExistsError(f"素材与导出脚本路径冲突: {target}")
                 existing_source = copies.get(target)
                 if existing_source is not None and existing_source != source:
-                    if existing_source.read_bytes() != source.read_bytes():
-                        raise FileExistsError(f"多个任务引用不同图片但导出路径相同: {target}")
+                    if not filecmp.cmp(existing_source, source, shallow=False):
+                        raise FileExistsError(f"多个任务引用不同素材但导出路径相同: {target}")
                 copies[target] = source
 
         for target, source in copies.items():
-            if target.exists() and (not target.is_file() or target.read_bytes() != source.read_bytes()):
+            if target.exists() and (not target.is_file() or not filecmp.cmp(target, source, shallow=False)):
                 raise FileExistsError(f"导出目录存在内容不同的模板图片: {target}")
         return [(source, target) for target, source in copies.items() if not target.exists()]
 
@@ -8695,7 +9119,7 @@ class MainWindow(QMainWindow):
                         with source.open("rb") as input_file:
                             shutil.copyfileobj(input_file, temporary)
                     if target.exists():
-                        if target.read_bytes() != source.read_bytes():
+                        if not filecmp.cmp(target, source, shallow=False):
                             raise FileExistsError(f"导出目录存在内容不同的模板图片: {target}")
                     else:
                         os.replace(staged, target)
@@ -8711,9 +9135,10 @@ class MainWindow(QMainWindow):
 
     def _sync_exported_image_paths(self, tasks: list[dict[str, Any]]) -> None:
         def sync_image(source: Any, exported: Any) -> None:
-            if isinstance(source, dict) and isinstance(exported, dict) and "image" in exported:
-                if source.get("image") != exported["image"]:
-                    source["image"] = exported["image"]
+            if isinstance(source, dict) and isinstance(exported, dict):
+                for field in ("image", "model"):
+                    if field in exported:
+                        source[field] = exported[field]
 
         for source_task, exported_task in zip(self.window_tasks, tasks):
             for source_step, exported_step in zip(source_task.get("steps", []), exported_task.get("steps", [])):
@@ -8763,6 +9188,9 @@ class MainWindow(QMainWindow):
             os.replace(staged_json, destination)
             self._sync_exported_image_paths(payload["window_tasks"])
             self.current_file = self._resolve_script_file(destination)
+            selected_node = self._selected_flow_node()
+            if selected_node is not None:
+                self._on_flow_node_selected(selected_node)
             self._set_dirty(False)
             self._write_autosave()
             self._append_log(f"已导出 JSON: {self.current_file}")
@@ -8910,21 +9338,47 @@ class MainWindow(QMainWindow):
         self._discarded_changes = answer == QMessageBox.Discard
         return self._discarded_changes
 
+    def _has_running_threads(self) -> bool:
+        return bool(
+            (self.worker_thread is not None and self.worker_thread.isRunning())
+            or any(run["thread"].isRunning() for run in self.window_task_runs.values())
+            or self.collection_page.is_running
+        )
+
+    def _finish_pending_close(self) -> None:
+        if self._close_requested and not self._has_running_threads():
+            self._close_timer.stop()
+            self.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:
-        if not self._confirm_discard():
+        if not self._close_requested:
+            if not self._confirm_discard():
+                event.ignore()
+                return
+            self._close_requested = True
+            self._autosave_timer.stop()
+            self._cancel_mouse_capture()
+            self._cancel_drag_recording()
+            self._cancel_macro_listeners()
+            self.collection_page.stop()
+            if self.worker:
+                self.worker.stop()
+            if self.worker_thread:
+                self.worker_thread.quit()
+            self._stop_all_window_tasks()
+            for run in self.window_task_runs.values():
+                run["thread"].quit()
+        # Keep QThread owners alive and the event loop responsive until all
+        # native work returns. Never terminate a thread holding input/GDI state.
+        if self._has_running_threads():
             event.ignore()
+            self.centralWidget().setEnabled(False)
+            self.main_toolbar.setEnabled(False)
+            self.statusBar().showMessage("正在安全停止任务，等待后台操作结束后关闭...")
+            self._close_timer.start()
             return
-        self._autosave_timer.stop()
-        self._cancel_mouse_capture()
-        self._cancel_drag_recording()
-        self._cancel_macro_listeners()
-        if self.worker:
-            self.worker.stop()
-        if self.worker_thread:
-            self.worker_thread.quit()
-            self.worker_thread.wait(1500)
-        self._stop_all_window_tasks()
-        self._wait_for_window_tasks()
+        self._close_timer.stop()
+        self._wait_for_window_tasks(0)
         if self._discarded_changes:
             self._restore_accepted_autosave()
         else:

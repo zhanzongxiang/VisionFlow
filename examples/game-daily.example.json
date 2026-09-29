@@ -1,0 +1,42 @@
+{
+  "games": {
+    "template-game": {
+      "window": {
+        "title_contains": "YOUR GAME WINDOW",
+        "process_name": "",
+        "timeout": 10
+      },
+      "max_seconds": 90,
+      "max_clicks": 5,
+      "steps": [
+        {
+          "name": "打开日常",
+          "target": {"image": "assets/daily.png", "confidence": 0.88},
+          "after": {"image": "assets/claim.png", "confidence": 0.88},
+          "timeout": 8
+        },
+        {
+          "name": "领取奖励",
+          "target": {"image": "assets/claim.png", "confidence": 0.88},
+          "after": {"image": "assets/claimed.png", "confidence": 0.88},
+          "optional": true,
+          "timeout": 3
+        }
+      ]
+    },
+    "mumu-yolo-game": {
+      "window": {"title_contains": "YOUR MUMU INSTANCE", "timeout": 10},
+      "max_seconds": 90,
+      "max_clicks": 5,
+      "steps": [
+        {
+          "name": "领取奖励",
+          "target": {"model": "assets/game.onnx", "class": "claim", "confidence": 0.75},
+          "after": {"model": "assets/game.onnx", "class": "claimed", "confidence": 0.75},
+          "optional": true,
+          "timeout": 4
+        }
+      ]
+    }
+  }
+}

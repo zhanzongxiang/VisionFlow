@@ -145,7 +145,7 @@ class ImageRecognitionResilienceTests(unittest.TestCase):
         with (
             patch.object(app.time, "monotonic", side_effect=monotonic),
             patch.object(Path, "is_file", autospec=True, side_effect=is_file),
-            patch.object(app.subprocess, "run", return_value=completed) as run,
+            patch.object(worker, "_run_cancellable_command", return_value=completed) as run,
         ):
             self.assertIsNone(worker._resolve_emulator_capture_backend())
             self.assertEqual(worker._emulator_capture_retry_at, 103.0)

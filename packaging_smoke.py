@@ -7,6 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise RuntimeError(message)
+
+
 def main() -> int:
     report = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd() / "packaging-smoke.log"
     def record(message: str) -> None:
@@ -23,7 +28,11 @@ def main() -> int:
         from PySide6.QtWidgets import QApplication
 
         import app
+        from capture_collection import CaptureSession
+        from yolo_runtime import YoloDetector
 
+        record(f"VisionFlow {app.APP_VERSION}")
+        require(callable(YoloDetector), "YOLO adapter import failed")
         record(f"OpenCV {cv2.__version__}, NumPy {np.__version__}: OK")
         qt_app = QApplication.instance() or QApplication([])
         app.configure_ui_font(qt_app)
@@ -33,6 +42,9 @@ def main() -> int:
                 app, "QSettings", side_effect=lambda *_args: QSettings(str(settings_path), QSettings.IniFormat)
             ):
                 window = app.MainWindow()
+                require(hasattr(window, "collection_page"), "Collection page is missing")
+                require(hasattr(window, "nav_collection_button"), "Collection navigation is missing")
+                window._autosave_timer.stop()
                 window.deleteLater()
                 record("Qt window: OK")
 
@@ -40,23 +52,36 @@ def main() -> int:
             frame = np.full((128, 256, 3), 255, dtype=np.uint8)
             cv2.putText(frame, "Test 123", (12, 82), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 0), 2)
             success, png = cv2.imencode(".png", frame)
-            assert success
+            require(success, "PNG encoding failed")
             path.write_bytes(png.tobytes())
+            session = CaptureSession(
+                Path(folder), "采集自检", {"hwnd": 1, "title": "Smoke"},
+                interval=1, limit=3, dedup=True,
+            )
+            capture_args = {"backend": "smoke", "origin": (0, 0), "captured_at": "smoke"}
+            first = session.save(frame, manual=False, **capture_args)
+            require(first is not None, "Collection failed to save first frame")
+            require(session.save(frame, manual=False, **capture_args) is None, "Collection dedup failed")
+            require(session.save(frame, manual=True, **capture_args) is not None, "Manual collection was dropped")
+            session.finish("stopped", "smoke")
+            require(session.saved == 2 and session.skipped == 1, "Collection counters differ")
+            require((session.directory / "frames.jsonl").is_file(), "Collection manifest is missing")
+            record("Collection storage, dedup and manual capture: OK")
             _cv2, decoded = app.ScriptWorker._read_color_image(path)
-            assert decoded.shape == frame.shape
+            require(decoded.shape == frame.shape, "Decoded image dimensions differ")
             worker = app.ScriptWorker([], Path(folder))
             worker._capture = lambda: (cv2, frame, (0, 0))
             worker._capture_window = lambda: (cv2, frame, (100, 200))
             step = {"image": str(path), "confidence": 0.95, "timeout": 1}
-            assert worker._wait_for_image(step) == (128, 64)
-            assert worker._wait_for_window_image(step) == (228, 264)
+            require(worker._wait_for_image(step) == (128, 64), "Screen image match returned incorrect coordinates")
+            require(worker._wait_for_window_image(step) == (228, 264), "Window image match returned incorrect coordinates")
             record("Chinese-path screen/window image steps: OK")
             scaled = cv2.resize(frame, None, fx=0.9, fy=0.9, interpolation=cv2.INTER_AREA)
             scaled_frame = cv2.copyMakeBorder(scaled, 12, 12, 18, 18, cv2.BORDER_CONSTANT)
             scaled_match = app.find_template_match(cv2, scaled_frame, frame)
-            assert scaled_match.score >= 0.95 and abs(scaled_match.scale - 0.9) < 0.001
+            require(scaled_match.score >= 0.95 and abs(scaled_match.scale - 0.9) < 0.001, "Multi-scale matching failed")
             fitted, content = app.fit_frame_to_size(cv2, frame, 300, 300)
-            assert fitted.shape[:2] == (300, 300) and content[2:] == (300, 150)
+            require(fitted.shape[:2] == (300, 300) and content[2:] == (300, 150), "Aspect-fit geometry differs")
             record("Multi-scale matching and aspect-fit capture: OK")
             record("Starting RapidOCR inference")
             worker._run_ocr(frame)
