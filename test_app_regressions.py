@@ -121,6 +121,36 @@ class AppRegressionTests(unittest.TestCase):
         flow = app.flow_from_steps([app.default_step("wait")])
         self.assertEqual(app.validate_flow(flow), [])
 
+    def test_image_color_threshold_normalizes_and_editor_preserves_it(self) -> None:
+        window = app.MainWindow()
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(window._autosave_timer.stop)
+        self.assertEqual(
+            window._normalize_step({"type": "window_click_image"})["pixel_similarity"], 0.0
+        )
+        self.assertEqual(
+            window._normalize_step({
+                "type": "window_click_image", "pixel_similarity": "invalid"
+            })["pixel_similarity"], 0.0
+        )
+        self.assertEqual(
+            window._normalize_step({
+                "type": "window_click_image", "pixel_similarity": 1.5
+            })["pixel_similarity"], 1.0
+        )
+
+        step = window._normalize_step({
+            "type": "window_click_image", "image": "button.png",
+            "pixel_similarity": 0.9,
+        })
+        task = window.window_tasks[0]
+        task["flow"] = app.flow_from_steps([step])
+        window._bind_task_steps(0, 0)
+        self.assertAlmostEqual(window.pixel_similarity_spin.value(), 0.9)
+        self.assertTrue(window.pixel_similarity_row.isVisibleTo(window.properties_scroll))
+        window.pixel_similarity_spin.setValue(0.92)
+        self.assertAlmostEqual(task["flow"]["nodes"][1]["step"]["pixel_similarity"], 0.92)
+
     def test_screen_capture_uses_virtual_desktop_monitor(self) -> None:
         class FakeMss:
             def __init__(self) -> None:

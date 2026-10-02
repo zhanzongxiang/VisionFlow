@@ -44,6 +44,23 @@ def main() -> int:
                 window = app.MainWindow()
                 require(hasattr(window, "collection_page"), "Collection page is missing")
                 require(hasattr(window, "nav_collection_button"), "Collection navigation is missing")
+                require(hasattr(window, "annotation_page"), "Annotation page is missing")
+                require(hasattr(window, "nav_annotation_button"), "Annotation navigation is missing")
+                require(
+                    hasattr(window.annotation_page, "rename_class_button")
+                    and hasattr(window.annotation_page, "delete_class_button"),
+                    "Annotation class controls are missing",
+                )
+                require(
+                    hasattr(window, "pixel_similarity_spin"),
+                    "Image color verification control is missing",
+                )
+                require(
+                    window._normalize_step({
+                        "type": "window_click_image", "pixel_similarity": 0.9,
+                    })["pixel_similarity"] == 0.9,
+                    "Image color threshold was not preserved on import",
+                )
                 window._autosave_timer.stop()
                 window.deleteLater()
                 record("Qt window: OK")
@@ -76,6 +93,14 @@ def main() -> int:
             require(worker._wait_for_image(step) == (128, 64), "Screen image match returned incorrect coordinates")
             require(worker._wait_for_window_image(step) == (228, 264), "Window image match returned incorrect coordinates")
             record("Chinese-path screen/window image steps: OK")
+            tinted = (frame.astype(np.float32) * 0.35 + 145).astype(np.uint8)
+            tinted_match = app.find_template_match(cv2, tinted, frame)
+            require(tinted_match.score >= 0.95, "Overlay test lost the structural match")
+            require(
+                app.template_pixel_similarity(cv2, tinted, frame, tinted_match) < 0.9,
+                "Overlay passed the image color threshold",
+            )
+            record("Image color threshold rejects overlay: OK")
             scaled = cv2.resize(frame, None, fx=0.9, fy=0.9, interpolation=cv2.INTER_AREA)
             scaled_frame = cv2.copyMakeBorder(scaled, 12, 12, 18, 18, cv2.BORDER_CONSTANT)
             scaled_match = app.find_template_match(cv2, scaled_frame, frame)

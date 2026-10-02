@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from capture_collection import CollectionPage
+from annotation_tool import AnnotationPage
 
 from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QRectF, QSize, QSettings, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QBrush, QColor, QCloseEvent, QCursor, QFont, QFontDatabase, QIcon, QImage, QKeySequence, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QShortcut
@@ -71,7 +72,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "识动 VisionFlow"
-APP_VERSION = "0.1.0-beta.2"
+APP_VERSION = "0.1.0-beta.3"
 SCRIPT_VERSION = 4
 APP_STYLESHEET = """
 QMainWindow, QDialog {
@@ -1234,7 +1235,10 @@ def default_step(step_type: str = "wait") -> dict[str, Any]:
     elif step_type == "wait":
         step["seconds"] = 1.0
     elif step_type in {"wait_image", "click_image", "window_wait_image", "window_click_image"}:
-        step.update({"image": "", "confidence": 0.85, "timeout": 10.0, "offset_x": 0, "offset_y": 0})
+        step.update({
+            "image": "", "confidence": 0.85, "pixel_similarity": 0.0,
+            "timeout": 10.0, "offset_x": 0, "offset_y": 0,
+        })
     elif step_type in {"window_detect_yolo", "window_click_yolo"}:
         step.update({
             "model": "", "target_class": "", "confidence": 0.5,
@@ -1403,6 +1407,24 @@ def find_template_match(
         if score > best.score:
             best = TemplateMatch(float(score), location, size, float(scale))
     return best
+
+
+def template_pixel_similarity(cv2_module, frame, template, match: TemplateMatch) -> float:
+    """Compare colors at a located match; NCC alone ignores uniform overlays."""
+    if match.score < 0:
+        return 0.0
+    width, height = match.size
+    x, y = match.location
+    region = frame[y:y + height, x:x + width]
+    if region.shape[:2] != (height, width):
+        return 0.0
+    if (width, height) == (template.shape[1], template.shape[0]):
+        candidate = template
+    else:
+        interpolation = cv2_module.INTER_AREA if match.scale < 1.0 else cv2_module.INTER_CUBIC
+        candidate = cv2_module.resize(template, (width, height), interpolation=interpolation)
+    rms = cv2_module.norm(region, candidate, cv2_module.NORM_L2) / math.sqrt(candidate.size)
+    return max(0.0, 1.0 - rms / 255.0)
 
 
 def fit_frame_to_size(cv2_module, frame, target_width: int, target_height: int):
@@ -4546,10 +4568,12 @@ class ScriptWorker(QObject):
         cv2, template = self._read_color_image(image_path)
         timeout = max(0.1, float(step.get("timeout", 10)))
         confidence = min(0.99, max(0.1, float(step.get("confidence", 0.85))))
+        pixel_threshold = _safe_float(step.get("pixel_similarity", 0.0), 0.0, 0.0, 1.0)
+        pixel_requirement = f" | 颜色相似度 {pixel_threshold:.2f}" if pixel_threshold else ""
         started = time.monotonic()
         self.log.emit(
             f"开始识别图片 | {image_path} | 模板 {template.shape[1]}x{template.shape[0]} | "
-            f"置信度 {confidence:.2f} | 缩放容差 90%-110% | 超时 {timeout:.2f} 秒"
+            f"置信度 {confidence:.2f}{pixel_requirement} | 缩放容差 90%-110% | 超时 {timeout:.2f} 秒"
         )
         best_match = TemplateMatch(-1.0, (0, 0), (template.shape[1], template.shape[0]), 1.0)
         best_frame = None
@@ -4557,12 +4581,17 @@ class ScriptWorker(QObject):
         capture_failures = 0
         last_capture_error = ""
         last_report = started
+        best_pixel_similarity = 0.0
         while time.monotonic() - started < timeout:
             self._check_stopped()
             try:
                 cv2_module, screen, screen_offset = self._capture()
                 last_frame = screen
                 current = find_template_match(cv2_module, screen, template)
+                current_pixel_similarity = (
+                    template_pixel_similarity(cv2_module, screen, template, current)
+                    if pixel_threshold else 0.0
+                )
             except AutomationError as exc:
                 capture_failures += 1
                 last_capture_error = str(exc)
@@ -4576,14 +4605,17 @@ class ScriptWorker(QObject):
             if current.score > best_match.score:
                 best_match = current
                 best_frame = screen.copy()
+            best_pixel_similarity = max(best_pixel_similarity, current_pixel_similarity)
+            pixel_report = f"颜色 {current_pixel_similarity:.3f} | " if pixel_threshold else ""
             if time.monotonic() - last_report >= 1.0:
                 self.log.emit(
                     f"图片识别中 | {image_path.name} | 当前 {current.score:.3f} | "
+                    f"{pixel_report}"
                     f"最高 {max(best_match.score, 0.0):.3f} | 最佳缩放 {best_match.scale * 100:.1f}% | "
                     f"{self._last_capture_backend} {screen.shape[1]}x{screen.shape[0]}"
                 )
                 last_report = time.monotonic()
-            if current.score >= confidence:
+            if current.score >= confidence and current_pixel_similarity >= pixel_threshold:
                 width, height = current.size
                 point = (
                     screen_offset[0] + current.location[0] + width // 2,
@@ -4591,6 +4623,7 @@ class ScriptWorker(QObject):
                 )
                 self.log.emit(
                     f"找到图片 | {image_path.name} | 匹配度 {current.score:.3f} | "
+                    f"{pixel_report}"
                     f"缩放 {current.scale * 100:.1f}% | 识别坐标 {point}"
                 )
                 return point
@@ -4601,10 +4634,13 @@ class ScriptWorker(QObject):
         error_detail = f" | 最后截图错误 {last_capture_error}" if last_capture_error else ""
         diagnostic_detail = f" | 失败截图 {diagnostic}" if diagnostic else ""
         capture_detail = f" | 截图 {self._last_capture_detail}" if self._last_capture_detail else ""
+        best_pixel_report = f"最高颜色相似度 {best_pixel_similarity:.3f} | " if pixel_threshold else ""
         self.log.emit(
             f"图片未识别 | {image_path} | 最高匹配度 {max(best_match.score, 0.0):.3f} | "
+            f"{best_pixel_report}"
             f"最佳缩放 {best_match.scale * 100:.1f}% | 截图失败 {capture_failures} 次 | "
-            f"要求 {confidence:.2f} | 超时 {timeout:.2f} 秒{capture_detail}{error_detail}{diagnostic_detail}"
+            f"要求 {confidence:.2f}{pixel_requirement} | 超时 {timeout:.2f} 秒"
+            f"{capture_detail}{error_detail}{diagnostic_detail}"
         )
         raise AutomationError(f"等待图片超时: {image_path.name}")
 
@@ -4613,10 +4649,12 @@ class ScriptWorker(QObject):
         cv2, template = self._read_color_image(image_path)
         timeout = max(0.1, float(step.get("timeout", 10)))
         confidence = min(0.99, max(0.1, float(step.get("confidence", 0.85))))
+        pixel_threshold = _safe_float(step.get("pixel_similarity", 0.0), 0.0, 0.0, 1.0)
+        pixel_requirement = f" | 颜色相似度 {pixel_threshold:.2f}" if pixel_threshold else ""
         started = time.monotonic()
         self.log.emit(
             f"开始识别窗口内图片 | {image_path} | 模板 {template.shape[1]}x{template.shape[0]} | "
-            f"置信度 {confidence:.2f} | 缩放容差 90%-110% | 超时 {timeout:.2f} 秒"
+            f"置信度 {confidence:.2f}{pixel_requirement} | 缩放容差 90%-110% | 超时 {timeout:.2f} 秒"
         )
         best_match = TemplateMatch(-1.0, (0, 0), (template.shape[1], template.shape[0]), 1.0)
         best_frame = None
@@ -4624,12 +4662,17 @@ class ScriptWorker(QObject):
         capture_failures = 0
         last_capture_error = ""
         last_report = started
+        best_pixel_similarity = 0.0
         while time.monotonic() - started < timeout:
             self._check_stopped()
             try:
                 cv2_module, frame, origin = self._capture_window()
                 last_frame = frame
                 current = find_template_match(cv2_module, frame, template)
+                current_pixel_similarity = (
+                    template_pixel_similarity(cv2_module, frame, template, current)
+                    if pixel_threshold else 0.0
+                )
             except AutomationError as exc:
                 if self._permanent_capture_error(exc):
                     raise
@@ -4645,14 +4688,17 @@ class ScriptWorker(QObject):
             if current.score > best_match.score:
                 best_match = current
                 best_frame = frame.copy()
+            best_pixel_similarity = max(best_pixel_similarity, current_pixel_similarity)
+            pixel_report = f"颜色 {current_pixel_similarity:.3f} | " if pixel_threshold else ""
             if time.monotonic() - last_report >= 1.0:
                 self.log.emit(
                     f"窗口内图片识别中 | {image_path.name} | 当前 {current.score:.3f} | "
+                    f"{pixel_report}"
                     f"最高 {max(best_match.score, 0.0):.3f} | 最佳缩放 {best_match.scale * 100:.1f}% | "
                     f"{self._last_capture_backend} {frame.shape[1]}x{frame.shape[0]}"
                 )
                 last_report = time.monotonic()
-            if current.score >= confidence:
+            if current.score >= confidence and current_pixel_similarity >= pixel_threshold:
                 width, height = current.size
                 point = (
                     origin[0] + current.location[0] + width // 2,
@@ -4660,6 +4706,7 @@ class ScriptWorker(QObject):
                 )
                 self.log.emit(
                     f"找到窗口内图片 | {image_path.name} | 匹配度 {current.score:.3f} | "
+                    f"{pixel_report}"
                     f"缩放 {current.scale * 100:.1f}% | 识别坐标 {point}"
                 )
                 return point
@@ -4670,10 +4717,12 @@ class ScriptWorker(QObject):
         error_detail = f" | 最后截图错误 {last_capture_error}" if last_capture_error else ""
         diagnostic_detail = f" | 失败截图 {diagnostic}" if diagnostic else ""
         capture_detail = f" | 截图 {self._last_capture_detail}" if self._last_capture_detail else ""
+        best_pixel_report = f"最高颜色相似度 {best_pixel_similarity:.3f} | " if pixel_threshold else ""
         self.log.emit(
             f"窗口内图片未识别 | {image_path} | 最高匹配度 {max(best_match.score, 0.0):.3f} | "
+            f"{best_pixel_report}"
             f"最佳缩放 {best_match.scale * 100:.1f}% | 截图失败 {capture_failures} 次 | "
-            f"后端 {self._last_capture_backend or '未知'} | 要求 {confidence:.2f} | "
+            f"后端 {self._last_capture_backend or '未知'} | 要求 {confidence:.2f}{pixel_requirement} | "
             f"超时 {timeout:.2f} 秒{capture_detail}{error_detail}{diagnostic_detail}"
         )
         raise AutomationError(f"窗口内图片超时: {image_path.name}")
@@ -5405,6 +5454,14 @@ class MainWindow(QMainWindow):
         self.confidence_spin.setDecimals(2)
         self.confidence_row = self._make_field_row(self.confidence_spin)
         self.form.addRow("匹配置信度", self.confidence_row)
+        self.pixel_similarity_spin = QDoubleSpinBox()
+        self.pixel_similarity_spin.setRange(0.0, 1.0)
+        self.pixel_similarity_spin.setSingleStep(0.01)
+        self.pixel_similarity_spin.setDecimals(2)
+        self.pixel_similarity_spin.setSpecialValueText("关闭")
+        self.pixel_similarity_spin.setToolTip("校验模板命中区域的颜色；0 为关闭，遮挡或蒙层造成的颜色变化会被拒绝")
+        self.pixel_similarity_row = self._make_field_row(self.pixel_similarity_spin)
+        self.form.addRow("颜色相似度", self.pixel_similarity_row)
         self.timeout_spin = QDoubleSpinBox()
         self.timeout_spin.setRange(0.1, 86400)
         self.timeout_spin.setDecimals(1)
@@ -5482,6 +5539,7 @@ class MainWindow(QMainWindow):
             self.image_button,
             self.capture_button,
             self.confidence_spin,
+            self.pixel_similarity_spin,
             self.timeout_spin,
             self.image_offset_x_spin,
             self.image_offset_y_spin,
@@ -5562,6 +5620,7 @@ class MainWindow(QMainWindow):
         self.run_history_page = self._build_run_history_page()
         self.template_library_page = self._build_template_library_page()
         self.collection_page = CollectionPage(ScriptWorker, self._draft_settings, self)
+        self.annotation_page = AnnotationPage(self._draft_settings, self)
         self.settings_page = self._build_settings_page()
 
         self.main_tabs = QStackedWidget()
@@ -5572,6 +5631,7 @@ class MainWindow(QMainWindow):
             self.run_history_page,
             self.template_library_page,
             self.collection_page,
+            self.annotation_page,
             self.settings_page,
         ):
             self.main_tabs.addWidget(page)
@@ -5603,6 +5663,7 @@ class MainWindow(QMainWindow):
         self.nav_logs_button = self._create_navigation_button("执行记录", QStyle.SP_MessageBoxInformation)
         self.nav_templates_button = self._create_navigation_button("模板库", QStyle.SP_FileIcon)
         self.nav_collection_button = self._create_navigation_button("数据采集", QStyle.SP_DesktopIcon)
+        self.nav_annotation_button = self._create_navigation_button("数据标注", QStyle.SP_FileDialogContentsView)
         self.nav_settings_button = self._create_navigation_button("设置", QStyle.SP_ComputerIcon)
         for button in (
             self.nav_tasks_button,
@@ -5610,6 +5671,7 @@ class MainWindow(QMainWindow):
             self.nav_logs_button,
             self.nav_templates_button,
             self.nav_collection_button,
+            self.nav_annotation_button,
         ):
             navigation_layout.addWidget(button, 0, Qt.AlignHCenter)
         navigation_layout.addStretch(1)
@@ -5638,6 +5700,7 @@ class MainWindow(QMainWindow):
         self.nav_logs_button.clicked.connect(lambda: self._show_workspace_page(self.run_history_page))
         self.nav_templates_button.clicked.connect(lambda: self._show_workspace_page(self.template_library_page))
         self.nav_collection_button.clicked.connect(lambda: self._show_workspace_page(self.collection_page))
+        self.nav_annotation_button.clicked.connect(lambda: self._show_workspace_page(self.annotation_page))
         self.nav_settings_button.clicked.connect(lambda: self._show_workspace_page(self.settings_page))
         self.inspector_close_button.clicked.connect(self._collapse_inspector)
         self.editor_task_box.currentIndexChanged.connect(self._editor_task_changed)
@@ -5685,6 +5748,7 @@ class MainWindow(QMainWindow):
         self.ocr_target_edit.textChanged.connect(self._form_changed)
         self.image_edit.textChanged.connect(self._form_changed)
         self.confidence_spin.valueChanged.connect(self._form_changed)
+        self.pixel_similarity_spin.valueChanged.connect(self._form_changed)
         self.timeout_spin.valueChanged.connect(self._form_changed)
         self.image_offset_x_spin.valueChanged.connect(self._form_changed)
         self.image_offset_y_spin.valueChanged.connect(self._form_changed)
@@ -5764,6 +5828,9 @@ class MainWindow(QMainWindow):
             context = f"模板库 · {count} 个素材"
         elif page is self.collection_page:
             context = "数据采集"
+        elif page is self.annotation_page:
+            count = self.annotation_page.image_count_label.text() if hasattr(self.annotation_page, "image_count_label") else "0 张图片"
+            context = f"数据标注 · {count}"
         else:
             context = "本地设置"
         self.workspace_context_label.setText(context)
@@ -5784,6 +5851,7 @@ class MainWindow(QMainWindow):
             self.run_history_page: (self.nav_logs_button, "执行记录 · 当前会话"),
             self.template_library_page: (self.nav_templates_button, "模板库 · 任务资源"),
             self.collection_page: (self.nav_collection_button, "数据采集"),
+            self.annotation_page: (self.nav_annotation_button, "数据标注 · YOLO 矩形框"),
             self.settings_page: (self.nav_settings_button, "本地设置"),
         }
         button, context = page_state.get(page, (None, APP_NAME))
@@ -7145,7 +7213,7 @@ class MainWindow(QMainWindow):
         for field in (
             self.coordinate_widget, self.drag_widget, self.macro_widget, self.key_row,
             self.text_row, self.seconds_row, self.ocr_widget, self.image_row, self.confidence_row,
-            self.timeout_row, self.image_offset_widget, self.yolo_model_row,
+            self.pixel_similarity_row, self.timeout_row, self.image_offset_widget, self.yolo_model_row,
             self.yolo_class_row, self.path_row, self.window_widget,
         ):
             self._set_form_row_visible(field, False)
@@ -7945,7 +8013,7 @@ class MainWindow(QMainWindow):
                        self.window_widget,
                        self.seconds_spin, self.ocr_target_edit, self.ocr_widget,
                        self.image_edit, self.image_button, self.capture_button,
-                       self.confidence_spin, self.timeout_spin, self.image_offset_widget,
+                       self.confidence_spin, self.pixel_similarity_spin, self.timeout_spin, self.image_offset_widget,
                        self.yolo_model_row, self.yolo_class_row, self.path_edit, self.condition_widget):
             widget.setEnabled(False)
         self.macro_event_table.clearContents()
@@ -7972,7 +8040,7 @@ class MainWindow(QMainWindow):
                        self.window_widget,
                        self.seconds_spin, self.ocr_target_edit, self.ocr_widget,
                        self.image_edit, self.image_button, self.capture_button,
-                       self.confidence_spin, self.timeout_spin, self.image_offset_widget,
+                       self.confidence_spin, self.pixel_similarity_spin, self.timeout_spin, self.image_offset_widget,
                        self.yolo_model_row, self.yolo_class_row, self.path_edit, self.condition_widget):
             widget.setEnabled(True)
         step = self.steps[row]
@@ -8010,6 +8078,7 @@ class MainWindow(QMainWindow):
         self.yolo_model_edit.setText(str(step.get("model", "")))
         self.yolo_class_edit.setText(str(step.get("target_class", "")))
         self.confidence_spin.setValue(float(step.get("confidence", 0.85)))
+        self.pixel_similarity_spin.setValue(float(step.get("pixel_similarity", 0.0)))
         self.timeout_spin.setValue(float(step.get("timeout", 10)))
         self.image_offset_x_spin.setValue(int(step.get("offset_x", 0)))
         self.image_offset_y_spin.setValue(int(step.get("offset_y", 0)))
@@ -8126,6 +8195,7 @@ class MainWindow(QMainWindow):
         self._set_form_row_visible(self.yolo_class_row, yolo_visible)
         recognition_visible = image_visible or ocr_visible or yolo_visible
         self._set_form_row_visible(self.confidence_row, recognition_visible)
+        self._set_form_row_visible(self.pixel_similarity_row, image_visible)
         self._set_form_row_visible(self.timeout_row, recognition_visible)
         self._set_form_row_visible(
             self.image_offset_widget,
@@ -8227,6 +8297,7 @@ class MainWindow(QMainWindow):
             step.update({
                 "image": self.image_edit.text(),
                 "confidence": self.confidence_spin.value(),
+                "pixel_similarity": self.pixel_similarity_spin.value(),
                 "timeout": self.timeout_spin.value(),
                 "offset_x": self.image_offset_x_spin.value(),
                 "offset_y": self.image_offset_y_spin.value(),
@@ -8864,10 +8935,10 @@ class MainWindow(QMainWindow):
             "press": ("key",),
             "type": ("text",),
             "wait": ("seconds",),
-            "wait_image": ("image", "confidence", "timeout"),
-            "click_image": ("image", "confidence", "timeout", "offset_x", "offset_y"),
-            "window_wait_image": ("image", "confidence", "timeout"),
-            "window_click_image": ("image", "confidence", "timeout", "offset_x", "offset_y"),
+            "wait_image": ("image", "confidence", "pixel_similarity", "timeout"),
+            "click_image": ("image", "confidence", "pixel_similarity", "timeout", "offset_x", "offset_y"),
+            "window_wait_image": ("image", "confidence", "pixel_similarity", "timeout"),
+            "window_click_image": ("image", "confidence", "pixel_similarity", "timeout", "offset_x", "offset_y"),
             "window_detect_yolo": ("model", "target_class", "confidence", "timeout"),
             "window_click_yolo": ("model", "target_class", "confidence", "timeout", "offset_x", "offset_y"),
             "ocr": ("target_text", "confidence", "timeout"),
@@ -8898,6 +8969,7 @@ class MainWindow(QMainWindow):
             step["seconds"] = _safe_float(step.get("seconds", 1.0), 1.0, 0.0)
         elif step_type in {"wait_image", "click_image", "window_wait_image", "window_click_image"}:
             step["confidence"] = _safe_float(step.get("confidence", 0.85), 0.85, 0.1, 0.99)
+            step["pixel_similarity"] = _safe_float(step.get("pixel_similarity", 0.0), 0.0, 0.0, 1.0)
             step["timeout"] = _safe_float(step.get("timeout", 10.0), 10.0, 0.1)
             if step_type in {"click_image", "window_click_image"}:
                 step["offset_x"] = _safe_int(step.get("offset_x", 0), 0)
@@ -9361,6 +9433,7 @@ class MainWindow(QMainWindow):
             self._cancel_drag_recording()
             self._cancel_macro_listeners()
             self.collection_page.stop()
+            self.annotation_page.save_current_if_dirty()
             if self.worker:
                 self.worker.stop()
             if self.worker_thread:

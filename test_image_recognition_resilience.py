@@ -45,6 +45,70 @@ class ImageRecognitionResilienceTests(unittest.TestCase):
                 self.assertEqual(match.size, expected_size)
                 self.assertAlmostEqual(match.scale, expected_scale)
 
+    def test_pixel_similarity_rejects_overlay_that_preserves_correlation(self) -> None:
+        template = self._pattern(width=24, height=18)
+        frame = np.zeros((60, 80, 3), dtype=np.uint8)
+        frame[17:35, 23:47] = template
+        match = app.find_template_match(cv2, frame, template)
+        self.assertEqual(match.location, (23, 17))
+        self.assertAlmostEqual(app.template_pixel_similarity(cv2, frame, template, match), 1.0)
+
+        covered = frame.copy()
+        covered[17:35, 23:47] = (template.astype(np.float32) * 0.35 + 145).astype(np.uint8)
+        covered_match = app.find_template_match(cv2, covered, template)
+        self.assertGreater(covered_match.score, 0.99)
+        self.assertLess(app.template_pixel_similarity(cv2, covered, template, covered_match), 0.9)
+
+    def test_click_step_rechecks_color_after_wait_step(self) -> None:
+        worker = app.ScriptWorker([], Path(__file__).parent)
+        template = self._pattern(width=24, height=18)
+        clear = np.zeros((60, 80, 3), dtype=np.uint8)
+        clear[17:35, 23:47] = template
+        covered = clear.copy()
+        covered[17:35, 23:47] = (template.astype(np.float32) * 0.35 + 145).astype(np.uint8)
+        worker._resolve_input_path = Mock(return_value=Path(__file__))
+        worker._read_color_image = Mock(return_value=(cv2, template))
+        worker._capture_window = Mock(side_effect=[
+            (cv2, clear, (100, 200)),
+            (cv2, covered, (100, 200)),
+            (cv2, clear, (100, 200)),
+        ])
+        worker._sleep = Mock()
+        worker._mouse_action = Mock()
+        step = {
+            "image": "button.png", "confidence": 0.95, "pixel_similarity": 0.9,
+            "timeout": 0.5,
+        }
+
+        worker.execute_step({"type": "window_wait_image", **step})
+        worker._mouse_action.assert_not_called()
+        worker.execute_step({"type": "window_click_image", **step})
+
+        self.assertEqual(worker._capture_window.call_count, 3)
+        worker._mouse_action.assert_called_once_with("click", 135, 226)
+
+    def test_click_step_times_out_without_clicking_when_only_overlay_exists(self) -> None:
+        worker = app.ScriptWorker([], Path(__file__).parent)
+        template = self._pattern(width=24, height=18)
+        covered = np.zeros((60, 80, 3), dtype=np.uint8)
+        covered[17:35, 23:47] = (template.astype(np.float32) * 0.35 + 145).astype(np.uint8)
+        worker._resolve_input_path = Mock(return_value=Path(__file__))
+        worker._read_color_image = Mock(return_value=(cv2, template))
+        worker._capture_window = Mock(return_value=(cv2, covered, (100, 200)))
+        worker._sleep = Mock()
+        worker._mouse_action = Mock()
+        worker._save_recognition_failure_frame = Mock(return_value=None)
+        ticks = iter(index * 0.01 for index in range(100))
+
+        with patch.object(app.time, "monotonic", side_effect=lambda: next(ticks)):
+            with self.assertRaisesRegex(app.AutomationError, "窗口内图片超时"):
+                worker.execute_step({
+                    "type": "window_click_image", "image": "button.png",
+                    "confidence": 0.95, "pixel_similarity": 0.9, "timeout": 0.1,
+                })
+
+        worker._mouse_action.assert_not_called()
+
     def test_fit_frame_to_size_preserves_aspect_ratio_and_reports_content(self) -> None:
         source = np.full((40, 80, 3), (20, 160, 220), dtype=np.uint8)
 
